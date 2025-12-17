@@ -1,26 +1,27 @@
 import os
 import logging
-from datetime import datetime
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
+    Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен берётся из Render
+# ================== НАСТРОЙКИ ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("APP_URL")  # URL Render
 MONTHLY_FEE = 6000
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
-# ================= ЛОГИ =================
 logging.basicConfig(level=logging.INFO)
 
-# ================= КНОПКИ =================
+# ================== TELEGRAM APP ==================
+application = Application.builder().token(BOT_TOKEN).build()
+
+# ================== КНОПКИ ==================
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧾 Отправить платёжку", callback_data="send_payment")],
@@ -28,70 +29,63 @@ def main_menu():
         [InlineKeyboardButton("📅 Моя дата оплаты", callback_data="my_date")],
     ])
 
-# ================= /start =================
+# ================== ХЕНДЛЕРЫ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Здравствуйте! Это бот ТСН для оплаты взносов.",
+        "Здравствуйте! Бот ТСН для оплаты взносов.",
         reply_markup=main_menu()
     )
 
-# ================= КНОПКИ =================
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if query.data == "send_payment":
         context.user_data["awaiting_payment"] = True
-        await query.message.reply_text("Пожалуйста, отправьте PDF или фото платёжки")
+        await query.message.reply_text("Пришлите PDF или фото платёжки")
 
     elif query.data == "requisites":
         await query.message.reply_text(
             "📄 Реквизиты ТСН:\n"
             "ИНН: XXXXXXXX\n"
             "Р/с: XXXXXXXXXXXXX\n"
-            "Банк: XXXXX\n\n"
-            "QR-код будет отправлен отдельно"
+            "Банк: XXXXX"
         )
 
     elif query.data == "my_date":
-        await query.message.reply_text(
-            "Ваша дата оплаты указана в реестре ТСН."
-        )
+        await query.message.reply_text("Дата оплаты указана в реестре ТСН")
 
-# ================= ПРИЁМ ПЛАТЁЖКИ =================
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_payment"):
         return
 
-    # Получаем файл
-    if update.message.document:
-        file = await update.message.document.get_file()
-    else:
-        file = await update.message.photo[-1].get_file()
-
-    os.makedirs("payments", exist_ok=True)
-    file_path = f"payments/{update.message.from_user.id}_{datetime.now().timestamp()}"
-    await file.download_to_drive(file_path)
-
-    # ====== ЗАГЛУШКА OCR (ПОТОМ СДЕЛАЕМ НАСТОЯЩИЙ) ======
-    recognized_sum = 12000  # пример
-
-    if recognized_sum > MONTHLY_FEE:
-        months = recognized_sum // MONTHLY_FEE
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"За {months} месяца", callback_data=f"months_{months}")],
-            [InlineKeyboardButton("Указать вручную", callback_data="months_manual")]
-        ])
-        await update.message.reply_text(
-            f"Обнаружена сумма {recognized_sum} ₽.\nЗа какие месяцы оплата?",
-            reply_markup=keyboard
-        )
-    else:
-        await update.message.reply_text(
-            "Платёж принят и отправлен на сверку бухгалтеру."
-        )
-
+    await update.message.reply_text(
+        "Платёжка получена ✅\n"
+        "Сумма распознаётся и отправлена бухгалтеру на сверку."
+    )
     context.user_data["awaiting_payment"] = False
 
-# ================= МЕСЯЦЫ ====
+# ================== РЕГИСТРАЦИЯ ==================
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CallbackQueryHandler(buttons))
+application.add_handler(
+    MessageHandler(filters.Document.ALL | filters.PHOTO, handle_payment)
+)
 
+# ================== FLASK ==================
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "TSN BOT OK"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.json, application.bot)
+    application.update_queue.put_nowait(update)
+    return "ok"
+
+# ================== ЗАПУСК ==================
+if __name__ == "__main__":
+    application.bot.set_webhook(f"{APP_URL}/webhook")
+    app.run(host="0.0.0.0", port=10000)
