@@ -1,72 +1,81 @@
-import os
 import logging
-from flask import Flask, request
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Dispatcher, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+from telegram.ext import CommandHandler, MessageHandler, Filters, CallbackQueryHandler, Updater
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pytesseract
+from pdf2image import convert_from_path
+from io import BytesIO
+from PIL import Image
+import requests
+import os
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")
+# --- Настройки ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
-logging.basicConfig(level=logging.INFO)
+# Логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-dispatcher = Dispatcher(bot=bot, update_queue=None, workers=0)
+# --- Google Sheets ---
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+gc = gspread.authorize(creds)
+sheet = gc.open_by_url(GOOGLE_SHEET_URL).sheet1
 
-# ================= КНОПКИ =================
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧾 Отправить платёжку", callback_data="send_payment")],
-        [InlineKeyboardButton("📄 Реквизиты ТСН", callback_data="requisites")]
-    ])
-
-# ================= ХЕНДЛЕРЫ =================
+# --- Бот ---
 def start(update, context):
-    update.message.reply_text(
-        "Здравствуйте! Бот ТСН.\nВыберите действие:",
-        reply_markup=main_menu()
-    )
+    update.message.reply_text("Привет! Отправь платежку через /paid")
 
-def buttons(update, context):
+def paid(update, context):
+    keyboard = [
+        [InlineKeyboardButton("Отправить PDF/картинку", callback_data='send_payment')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text('Нажми кнопку для отправки платежки', reply_markup=reply_markup)
+
+def button(update, context):
     query = update.callback_query
     query.answer()
-
     if query.data == "send_payment":
-        query.message.reply_text("Пришлите PDF или фото платёжки")
+        query.edit_message_text(text="Отправьте PDF или картинку с платежкой")
 
-    elif query.data == "requisites":
-        query.message.reply_text(
-            "📄 Реквизиты ТСН:\n"
-            "ИНН: XXXXXXXX\n"
-            "Р/с: XXXXXXXXX\n"
-            "Банк: XXXXX"
-        )
+def handle_document(update, context):
+    file = update.message.document.get_file()
+    file_bytes = BytesIO()
+    file.download(out=file_bytes)
+    file_bytes.seek(0)
 
-def handle_files(update, context):
-    update.message.reply_text(
-        "Платёжка получена ✅\n"
-        "Данные будут проверены бухгалтером."
-    )
+    # Если PDF
+    if update.message.document.file_name.endswith(".pdf"):
+        images = convert_from_path(file_bytes)
+        text = ""
+        for img in images:
+            text += pytesseract.image_to_string(img)
+    else:
+        # Картинка
+        img = Image.open(file_bytes)
+        text = pytesseract.image_to_string(img)
 
-# ================= РЕГИСТРАЦИЯ =================
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CallbackQueryHandler(buttons))
-dispatcher.add_handler(MessageHandler(Filters.document | Filters.photo, handle_files))
+    update.message.reply_text(f"Распознан текст:\n{text[:500]}...")  # первые 500 символов
 
-# ================= FLASK =================
-app = Flask(__name__)
+    # Сюда можно добавить логику: сумма, месяцы, запись в Google Sheet
 
-@app.route("/")
-def index():
-    return "TSN BOT OK"
+def main():
+    # Используем Updater и polling (Render Free)
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.json, bot)
-    dispatcher.process_update(update)
-    return "ok"
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("paid", paid))
+    dp.add_handler(CallbackQueryHandler(button))
+    dp.add_handler(MessageHandler(Filters.document | Filters.photo, handle_document))
 
-# ================= ЗАПУСК =================
-if __name__ == "__main__":
-    bot.set_webhook(f"{APP_URL}/webhook")
-    app.run(host="0.0.0.0", port=10000)
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
