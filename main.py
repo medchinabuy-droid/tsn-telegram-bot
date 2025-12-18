@@ -1,49 +1,145 @@
+import os
+import json
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from datetime import datetime
+
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Настройка логов
+
+# ================= НАСТРОЙКИ =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPREADSHEET_NAME = "УЧАСТКИ"  # НАЗВАНИЕ ТАБЛИЦЫ В GOOGLE
+SHEET_NAME = "Лист1"          # НАЗВАНИЕ ЛИСТА
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
-# Подключение к Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-creds = Credentials.from_service_account_file('telegram-bot-481523-05b49bfbb763.json', scopes=SCOPES)
-gc = gspread.authorize(creds)
-SHEET = gc.open("Название вашей таблицы").sheet1  # Первый лист
 
-# Команда /start
+# ================= GOOGLE SHEETS =================
+
+google_creds_json = os.getenv("GOOGLE_CREDS_JSON")
+
+if not google_creds_json:
+    raise RuntimeError("GOOGLE_CREDS_JSON не задан в Render")
+
+creds_dict = json.loads(google_creds_json)
+
+credentials = Credentials.from_service_account_info(
+    creds_dict,
+    scopes=SCOPES
+)
+
+gc = gspread.authorize(credentials)
+spreadsheet = gc.open(SPREADSHEET_NAME)
+sheet = spreadsheet.worksheet(SHEET_NAME)
+
+
+# ================= ВСПОМОГАТЕЛЬНОЕ =================
+
+def find_row_by_telegram_id(telegram_id: int):
+    records = sheet.get_all_records()
+    for idx, row in enumerate(records, start=2):
+        if str(row.get("Telegram_ID")) == str(telegram_id):
+            return idx
+    return None
+
+
+def find_row_by_phone(phone: str):
+    records = sheet.get_all_records()
+    for idx, row in enumerate(records, start=2):
+        if str(row.get("Телефон")) == phone:
+            return idx
+    return None
+
+
+# ================= HANDLERS =================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    keyboard = [
-        [InlineKeyboardButton("Отправить контакт", request_contact=True)]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    button = KeyboardButton("Отправить номер телефона", request_contact=True)
+    keyboard = ReplyKeyboardMarkup([[button]], resize_keyboard=True)
+
     await update.message.reply_text(
-        f"Привет, {user.first_name}! Отправь мне свой контакт.",
-        reply_markup=reply_markup
+        "Здравствуйте! Нажмите кнопку ниже, чтобы отправить номер телефона.",
+        reply_markup=keyboard
     )
 
-# Обработка контактов
+
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contact = update.message.contact
-    username = update.effective_user.username or ""
-    phone = contact.phone_number or ""
-    name = contact.first_name or ""
+    telegram_id = update.message.from_user.id
+    phone = contact.phone_number
 
-    # Добавление в Google Sheets
-    SHEET.append_row([username, name, phone])
-    await update.message.reply_text(f"Данные сохранены: {name} ({username}) {phone}")
+    row = find_row_by_phone(phone)
 
-# Настройка приложения
-app = ApplicationBuilder().token("ВАШ_ТОКЕН_БОТА").build()
+    if not row:
+        await update.message.reply_text(
+            "❌ Ваш номер не найден в таблице.\n"
+            "Обратитесь к администратору."
+        )
+        return
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters=Filters.CONTACT, callback=handle_contact))
+    sheet.update(f"C{row}", telegram_id)
 
-# Запуск
-app.run_polling()
+    await update.message.reply_text(
+        "✅ Номер подтверждён!\n"
+        "Telegram ID сохранён."
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.message.from_user.id
+    username = update.message.from_user.username
+
+    row = find_row_by_telegram_id(telegram_id)
+
+    if row:
+        await update.message.reply_text("✅ Вы уже зарегистрированы.")
+        return
+
+    if username:
+        records = sheet.get_all_records()
+        for idx, r in enumerate(records, start=2):
+            if r.get("Telegram_ID") == f"@{username}":
+                sheet.update(f"C{idx}", telegram_id)
+                await update.message.reply_text("✅ Telegram ID обновлён.")
+                return
+
+    await update.message.reply_text(
+        "❌ Вы не найдены в таблице.\n"
+        "Нажмите /start и отправьте номер телефона."
+    )
+
+
+# ================= ЗАПУСК =================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logging.info("🤖 Бот запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
