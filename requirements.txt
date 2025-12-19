@@ -1,4 +1,5 @@
 Flask==3.0.3
 python-telegram-bot==20.7
-gspread==6.2.1
-google-auth==2.41.1
+gspread==6.1.2
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
