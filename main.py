@@ -1,33 +1,28 @@
-import os
-from flask import Flask, request
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-from google.oauth2.service_account import Credentials
+import time
 import gspread
+from google.oauth2.service_account import Credentials
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# ======================================================
+# ПАУЗА ДЛЯ RENDER (ОЧЕНЬ ВАЖНО, УБИРАЕТ invalid_grant)
+# ======================================================
+time.sleep(20)
 
 # ================= НАСТРОЙКИ =================
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_БОТА"
 
 CREDENTIALS_FILE = "telegram-bot-481523-ab2d76ed43b1.json"
 
-SPREADSHEET_NAME = "ВАШЕ_НАЗВАНИЕ_ТАБЛИЦЫ"  # ← замени
-SHEET_NAME = "Лист1"                        # ← или другое имя
+SPREADSHEET_NAME = "ИМЯ_ТВОЕЙ_GOOGLE_ТАБЛИЦЫ"
+SHEET_NAME = "Лист1"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive"
 ]
 
-PORT = int(os.environ.get("PORT", 10000))
-
 # ================= GOOGLE SHEETS =================
-
 creds = Credentials.from_service_account_file(
     CREDENTIALS_FILE,
     scopes=SCOPES
@@ -37,50 +32,19 @@ gc = gspread.authorize(creds)
 sheet = gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
 
 # ================= TELEGRAM =================
-
-app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text
-
-    tg_id = user.id
-    username = user.username or ""
-    phone = user.phone_number if hasattr(user, "phone_number") else ""
-
-    rows = sheet.get_all_values()
-
-    for i, row in enumerate(rows[1:], start=2):
-        if len(row) < 3:
-            continue
-
-        if str(row[2]) == str(tg_id) or row[2] == f"@{username}":
-            sheet.update(f"C{i}", [[tg_id]])
-            await update.message.reply_text("✅ Вы успешно привязаны")
-            return
 
     await update.message.reply_text(
-        "❗ Вас нет в таблице. Обратитесь к администратору."
+        f"Бот работает ✅\n\n"
+        f"ФИО: {user.full_name}\n"
+        f"Telegram ID: {user.id}"
     )
 
-app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ================= FLASK (WEBHOOK) =================
-
-flask_app = Flask(__name__)
-
-@flask_app.route("/", methods=["GET"])
-def index():
-    return "Bot is running", 200
-
-@flask_app.route("/webhook", methods=["POST"])
-async def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, app_tg.bot)
-    await app_tg.process_update(update)
-    return "ok", 200
-
-# ================= ЗАПУСК =================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.run_polling()
 
 if __name__ == "__main__":
-    flask_app.run(host="0.0.0.0", port=PORT)
+    main()
