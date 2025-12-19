@@ -14,7 +14,7 @@ import gspread
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-CREDENTIALS_FILE = "telegram-bot-481523-b9c69d6d59fb.json"
+CREDENTIALS_FILE = "telegram-bot-481523-ab2d76ed43b1.json"
 
 SPREADSHEET_NAME = "ВАШЕ_НАЗВАНИЕ_ТАБЛИЦЫ"  # ← замени
 SHEET_NAME = "Лист1"                        # ← или другое имя
