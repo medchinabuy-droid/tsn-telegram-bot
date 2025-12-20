@@ -1,50 +1,71 @@
-import time
-import gspread
-from google.oauth2.service_account import Credentials
+import os
+import json
+import logging
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ======================================================
-# ПАУЗА ДЛЯ RENDER (ОЧЕНЬ ВАЖНО, УБИРАЕТ invalid_grant)
-# ======================================================
-time.sleep(20)
+import gspread
+from google.oauth2.service_account import Credentials
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_БОТА"
 
-CREDENTIALS_FILE = "telegram-bot-481523-ab2d76ed43b1.json"
+# ---------------- НАСТРОЙКИ ----------------
 
-SPREADSHEET_NAME = "ИМЯ_ТВОЕЙ_GOOGLE_ТАБЛИЦЫ"
+SPREADSHEET_NAME = "ИМЯ_ТАБЛИЦЫ"
 SHEET_NAME = "Лист1"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# ================= GOOGLE SHEETS =================
-creds = Credentials.from_service_account_file(
-    CREDENTIALS_FILE,
+# ---------------- ЛОГИ ----------------
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# ---------------- GOOGLE AUTH ----------------
+
+creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+
+creds = Credentials.from_service_account_info(
+    creds_dict,
     scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
 sheet = gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
 
-# ================= TELEGRAM =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+# ---------------- TELEGRAM ----------------
 
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Бот работает ✅\n\n"
-        f"ФИО: {user.full_name}\n"
-        f"Telegram ID: {user.id}"
+        "✅ Бот запущен и подключён к Google Sheets"
     )
 
+
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+
+    if not text:
+        await update.message.reply_text("❌ Напиши текст: /add что-то")
+        return
+
+    sheet.append_row([text])
+    await update.message.reply_text("✅ Добавлено в таблицу")
+
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add))
+
+    print("🤖 Бот запущен")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
