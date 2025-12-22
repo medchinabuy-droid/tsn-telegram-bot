@@ -14,7 +14,10 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_NAME = "ИМЯ_ТАБЛИЦЫ"
 SHEET_NAME = "Лист1"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
 # ---------------- ЛОГИ ----------------
 
