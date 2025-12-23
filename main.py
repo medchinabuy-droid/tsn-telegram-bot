@@ -16,7 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
-SHEET_NAME = "Лист1"  # название вкладки
+SHEET_NAME = "Лист 1"  # название вкладки
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
