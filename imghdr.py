@@ -1,4 +1,4 @@
-# Backport of imghdr for Python 3.13 compatibility
+# Backport of imghdr for Python 3.11.9 compatibility
 
 def what(file, h=None):
     if h is None:
