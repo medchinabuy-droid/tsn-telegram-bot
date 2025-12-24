@@ -1,15 +1,25 @@
 import os
 import json
 import logging
-import threading
+from datetime import datetime
 
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
 import gspread
 from google.oauth2.service_account import Credentials
 
+import pytesseract
+from PIL import Image
 
 # ================= НАСТРОЙКИ =================
 
@@ -17,81 +27,118 @@ BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
-SHEET_NAME = "Лист 1"
+
+SHEET_USERS = "Лист 1"
+SHEET_CHECKS = "Чеки"
 
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
 ]
 
-PORT = int(os.environ.get("PORT", 10000))
-
+HOUSE_NAME = "Дом_1"
 
 # ================= ЛОГИ =================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-logger = logging.getLogger(__name__)
-
-
-# ================= GOOGLE SHEETS =================
+# ================= GOOGLE =================
 
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
-
-creds = Credentials.from_service_account_info(
-    creds_dict,
-    scopes=SCOPES
-)
-
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
-logger.info("📄 Подключение к Google Sheets успешно")
+sheet_checks = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_CHECKS)
 
+logging.info("📄 Подключение к Google Sheets успешно")
+
+# ================= OCR =================
+
+def recognize_text(image_path):
+    image = Image.open(image_path)
+    text = pytesseract.image_to_string(image, lang="rus+eng")
+    return text
 
 # ================= TELEGRAM =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот запущен и работает")
+    keyboard = [
+        ["💳 Реквизиты"],
+        ["📎 Загрузить чек"]
+    ]
 
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
+    await update.message.reply_text(
+        "✅ Бот ТСН запущен\n\n"
+        "Выберите действие:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
 
-    if not text:
-        await update.message.reply_text("❌ Используй: /add текст")
-        return
+async def show_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "💳 Реквизиты":
+        await update.message.reply_text(
+            "💳 Реквизиты для оплаты:\n\n"
+            "Получатель: ТСН «Пример»\n"
+            "ИНН: 0000000000\n"
+            "Счёт: 00000000000000000000\n"
+            "Банк: Пример Банк\n\n"
+            "❗ После оплаты загрузите чек"
+        )
 
-    sheet.append_row([text])
-    await update.message.reply_text("✅ Записано в таблицу!")
+async def upload_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "📎 Загрузить чек":
+        await update.message.reply_text(
+            "📸 Отправьте фото чека одним сообщением"
+        )
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
 
-def run_bot():
+    date_folder = datetime.now().strftime("%Y-%m-%d")
+    filename = f"check_{user.id}.jpg"
+    temp_path = f"/tmp/{filename}"
+
+    await file.download_to_drive(temp_path)
+
+    text = recognize_text(temp_path)
+
+    amount = "Не найдено"
+    for line in text.splitlines():
+        if "₽" in line or "RUB" in line:
+            amount = line.strip()
+            break
+
+    sheet_checks.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        user.username or user.id,
+        "",
+        amount,
+        "На проверке",
+        "Файл загружен"
+    ])
+
+    await update.message.reply_text(
+        "✅ Чек получен\n"
+        "📄 Статус: На проверке"
+    )
+
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add))
+    app.add_handler(MessageHandler(filters.TEXT, show_requisites))
+    app.add_handler(MessageHandler(filters.TEXT, upload_hint))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logger.info("🤖 Telegram-бот запущен")
+    logging.info("🤖 Бот запущен")
     app.run_polling()
 
-
-# ================= FLASK (ДЛЯ RENDER) =================
-
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "OK", 200
-
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
-
-
-# ================= MAIN =================
-
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    run_flask()
+    main()
