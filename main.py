@@ -1,7 +1,9 @@
 import os
 import json
 import logging
+import threading
 
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -11,7 +13,7 @@ from google.oauth2.service_account import Credentials
 
 # ================= НАСТРОЙКИ =================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
@@ -21,29 +23,22 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-# ================= ПРОВЕРКИ =================
+PORT = int(os.environ.get("PORT", 10000))
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ Переменная BOT_TOKEN не задана в Render")
-
-if not GOOGLE_CREDS_JSON:
-    raise RuntimeError("❌ Переменная GOOGLE_CREDENTIALS_JSON не задана в Render")
 
 # ================= ЛОГИ =================
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 
-logging.info("✅ Переменные окружения загружены")
+logger = logging.getLogger(__name__)
+
 
 # ================= GOOGLE SHEETS =================
 
-try:
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-except json.JSONDecodeError:
-    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON — невалидный JSON")
+creds_dict = json.loads(GOOGLE_CREDS_JSON)
 
 creds = Credentials.from_service_account_info(
     creds_dict,
@@ -51,18 +46,15 @@ creds = Credentials.from_service_account_info(
 )
 
 gc = gspread.authorize(creds)
-
 sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
-logging.info("📄 Подключение к Google Sheets успешно")
+logger.info("📄 Подключение к Google Sheets успешно")
 
-# ================= TELEGRAM HANDLERS =================
+
+# ================= TELEGRAM =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Бот запущен и подключён к Google Таблице"
-    )
-
+    await update.message.reply_text("✅ Бот запущен и работает")
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
@@ -72,20 +64,34 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sheet.append_row([text])
-    await update.message.reply_text("✅ Записано в таблицу")
+    await update.message.reply_text("✅ Записано в таблицу!")
 
 
-# ================= ЗАПУСК =================
-
-def main():
+def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add))
 
-    logging.info("🤖 Telegram-бот запущен")
+    logger.info("🤖 Telegram-бот запущен")
     app.run_polling()
 
 
+# ================= FLASK (ДЛЯ RENDER) =================
+
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    return "OK", 200
+
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT)
+
+
+# ================= MAIN =================
+
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_bot).start()
+    run_flask()
