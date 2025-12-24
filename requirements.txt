@@ -1,5 +1,7 @@
-python-telegram-bot==21.6
+python-telegram-bot==20.7
 gspread==6.1.2
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
 Flask==3.0.3
+pytesseract==0.3.10
+Pillow==10.2.0
