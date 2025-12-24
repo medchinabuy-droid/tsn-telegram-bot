@@ -3,10 +3,7 @@ import json
 import logging
 from datetime import datetime
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup
-)
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -18,126 +15,158 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-import pytesseract
-from PIL import Image
-
 # ================= НАСТРОЙКИ =================
 
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
 
-SHEET_USERS = "Лист 1"
+SHEET_USERS = "Жильцы"
 SHEET_CHECKS = "Чеки"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+ADMIN_IDS = [123456789]  # <-- ВПИШИ СВОЙ TELEGRAM ID
 
-HOUSE_NAME = "Дом_1"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ================= ЛОГИ =================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
 # ================= GOOGLE =================
 
-creds_dict = json.loads(GOOGLE_CREDS_JSON)
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(GOOGLE_CREDS_JSON),
+    scopes=SCOPES
+)
 gc = gspread.authorize(creds)
 
-sheet_checks = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_CHECKS)
+users_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_USERS)
+checks_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_CHECKS)
 
-logging.info("📄 Подключение к Google Sheets успешно")
+# ================= ВСПОМОГАТЕЛЬНОЕ =================
 
-# ================= OCR =================
-
-def recognize_text(image_path):
-    image = Image.open(image_path)
-    text = pytesseract.image_to_string(image, lang="rus+eng")
-    return text
+def get_user_row(tg_id):
+    users = users_sheet.get_all_records()
+    for i, u in enumerate(users, start=2):
+        if str(u["telegram_id"]) == str(tg_id):
+            return i, u
+    return None, None
 
 # ================= TELEGRAM =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["💳 Реквизиты"],
-        ["📎 Загрузить чек"]
-    ]
+    user = update.effective_user
 
+    row, data = get_user_row(user.id)
+
+    if not data:
+        users_sheet.append_row([
+            user.id,
+            user.username,
+            "",
+            "",
+            ""
+        ])
+        await update.message.reply_text("Введите ФИО:")
+        context.user_data["step"] = "fio"
+        return
+
+    for field in ["ФИО", "Дом", "Телефон"]:
+        if not data[field]:
+            await update.message.reply_text(f"Введите {field}:")
+            context.user_data["step"] = field
+            return
+
+    keyboard = [["💳 Реквизиты", "📎 Загрузить чек"]]
     await update.message.reply_text(
-        "✅ Бот ТСН запущен\n\n"
         "Выберите действие:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True
-        )
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
-async def show_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    step = context.user_data.get("step")
+
+    if step:
+        row, _ = get_user_row(user.id)
+        col_map = {"ФИО": 3, "Дом": 4, "Телефон": 5}
+        users_sheet.update_cell(row, col_map[step], update.message.text)
+        context.user_data["step"] = None
+        await start(update, context)
+        return
+
     if update.message.text == "💳 Реквизиты":
         await update.message.reply_text(
-            "💳 Реквизиты для оплаты:\n\n"
-            "Получатель: ТСН «Пример»\n"
-            "ИНН: 0000000000\n"
-            "Счёт: 00000000000000000000\n"
-            "Банк: Пример Банк\n\n"
-            "❗ После оплаты загрузите чек"
+            "💳 Реквизиты:\n\n"
+            "ТСН «_____»\n"
+            "Счёт: _____\n"
+            "Банк: _____"
         )
 
-async def upload_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "📎 Загрузить чек":
-        await update.message.reply_text(
-            "📸 Отправьте фото чека одним сообщением"
-        )
+        await update.message.reply_text("Отправьте фото чека")
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
+    row, data = get_user_row(user.id)
 
-    date_folder = datetime.now().strftime("%Y-%m-%d")
-    filename = f"check_{user.id}.jpg"
-    temp_path = f"/tmp/{filename}"
+    check_id = int(datetime.now().timestamp())
 
-    await file.download_to_drive(temp_path)
-
-    text = recognize_text(temp_path)
-
-    amount = "Не найдено"
-    for line in text.splitlines():
-        if "₽" in line or "RUB" in line:
-            amount = line.strip()
-            break
-
-    sheet_checks.append_row([
+    checks_sheet.append_row([
+        check_id,
+        user.id,
+        data["ФИО"],
+        data["Дом"],
         datetime.now().strftime("%Y-%m-%d %H:%M"),
-        user.username or user.id,
-        "",
-        amount,
-        "На проверке",
-        "Файл загружен"
+        "На проверке"
     ])
 
     await update.message.reply_text(
-        "✅ Чек получен\n"
-        "📄 Статус: На проверке"
+        f"✅ Чек принят\nID: {check_id}\nСтатус: На проверке"
     )
 
+async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    check_id = context.args[0]
+    rows = checks_sheet.get_all_records()
+
+    for i, r in enumerate(rows, start=2):
+        if str(r["id"]) == check_id:
+            checks_sheet.update_cell(i, 6, "Принят")
+            await context.bot.send_message(
+                r["telegram_id"],
+                f"✅ Ваш чек {check_id} ПРИНЯТ"
+            )
+            return
+
+async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    check_id = context.args[0]
+    rows = checks_sheet.get_all_records()
+
+    for i, r in enumerate(rows, start=2):
+        if str(r["id"]) == check_id:
+            checks_sheet.update_cell(i, 6, "Отклонён")
+            await context.bot.send_message(
+                r["telegram_id"],
+                f"❌ Ваш чек {check_id} ОТКЛОНЁН"
+            )
+            return
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, show_requisites))
-    app.add_handler(MessageHandler(filters.TEXT, upload_hint))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("accept", accept))
+    app.add_handler(CommandHandler("reject", reject))
+    app.add_handler(MessageHandler(filters.TEXT, text_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
-    logging.info("🤖 Бот запущен")
     app.run_polling()
 
 if __name__ == "__main__":
