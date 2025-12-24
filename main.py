@@ -1,123 +1,200 @@
 import os
 import json
 import logging
+from datetime import datetime, timedelta
 
-from flask import Flask, request, abort
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters
 )
 
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+import io
 
 # ================= НАСТРОЙКИ =================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
-SHEET_NAME = "Лист 1"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# ================= ПРОВЕРКИ =================
-
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не задан")
-
-if not GOOGLE_CREDS_JSON:
-    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON не задан")
-
-if not WEBHOOK_SECRET:
-    raise RuntimeError("❌ WEBHOOK_SECRET не задан")
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
 # ================= ЛОГИ =================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 
-logging.info("✅ Переменные окружения загружены")
-
-# ================= GOOGLE SHEETS =================
-
-creds_dict = json.loads(GOOGLE_CREDS_JSON)
+# ================= GOOGLE =================
 
 creds = Credentials.from_service_account_info(
-    creds_dict,
+    json.loads(GOOGLE_CREDS_JSON),
     scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+sh = gc.open_by_key(SPREADSHEET_ID)
 
-logging.info("📄 Подключение к Google Sheets успешно")
+users_sheet = sh.worksheet("Лист 1")
+checks_sheet = sh.worksheet("Чеки")
 
-# ================= TELEGRAM =================
+drive = build("drive", "v3", credentials=creds)
 
-app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
+# ================= DRIVE =================
+
+ROOT_FOLDER_NAME = "TSN_CHECKS"
+
+def get_or_create_folder(name, parent=None):
+    q = f"name='{name}' and mimeType='application/vnd.google-apps.folder'"
+    if parent:
+        q += f" and '{parent}' in parents"
+
+    res = drive.files().list(q=q, fields="files(id)").execute()
+    if res["files"]:
+        return res["files"][0]["id"]
+
+    body = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent] if parent else []
+    }
+    return drive.files().create(body=body, fields="id").execute()["id"]
+
+ROOT_FOLDER_ID = get_or_create_folder(ROOT_FOLDER_NAME)
+
+# ================= КНОПКИ =================
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Реквизиты", callback_data="reqs")],
+        [InlineKeyboardButton("📤 Загрузить чек", callback_data="upload")],
+        [InlineKeyboardButton("📊 Мой статус", callback_data="status")]
+    ])
+
+# ================= НАПОМИНАНИЯ =================
+
+def check_payments():
+    today = datetime.now().date()
+    users = users_sheet.get_all_records()
+    checks = checks_sheet.get_all_records()
+
+    for u in users:
+        if not u["telegram_id"]:
+            continue
+
+        pay_day = int(u["День_оплаты"])
+        user_id = int(u["telegram_id"])
+
+        pay_date = today.replace(day=pay_day)
+        reminder_date = pay_date - timedelta(days=5)
+        debt_date = pay_date + timedelta(days=1)
+
+        paid = any(
+            str(r["telegram_id"]) == str(user_id) and
+            r["Дата"].startswith(today.strftime("%Y-%m"))
+            for r in checks
+        )
+
+        if today == reminder_date:
+            yield user_id, "🔔 Напоминание: скоро срок оплаты взноса"
+
+        if today == debt_date and not paid:
+            yield user_id, "❗ Образовался долг. Пожалуйста, оплатите взнос."
 
 # ================= HANDLERS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Бот работает через webhook"
+        "👋 Добро пожаловать в бот ТСН",
+        reply_markup=main_keyboard()
     )
 
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("❌ Используй: /add текст")
-        return
+    for uid, text in check_payments():
+        await context.bot.send_message(uid, text)
 
-    sheet.append_row([text])
-    await update.message.reply_text("✅ Записано")
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-app_tg.add_handler(CommandHandler("start", start))
-app_tg.add_handler(CommandHandler("add", add))
+    user_id = query.from_user.id
+    users = users_sheet.get_all_records()
+    user = next(u for u in users if str(u["telegram_id"]) == str(user_id))
 
-# ================= FLASK =================
+    if query.data == "reqs":
+        await query.message.reply_text("💳 Реквизиты ТСН:\nXXXX XXXX XXXX")
 
-flask_app = Flask(__name__)
+    if query.data == "status":
+        checks = checks_sheet.get_all_records()
+        last = next((c for c in reversed(checks)
+                    if str(c["telegram_id"]) == str(user_id)), None)
 
-@flask_app.route("/", methods=["GET"])
-def index():
-    return "OK", 200
+        if not last:
+            await query.message.reply_text("❌ Чеков нет")
+        else:
+            await query.message.reply_text(f"📄 Статус: {last['Статус']}")
 
-@flask_app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
-async def webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        abort(403)
+async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    user_id = update.effective_user.id
 
-    update = Update.de_json(request.get_json(force=True), app_tg.bot)
-    await app_tg.process_update(update)
-    return "OK", 200
+    user = next(u for u in users_sheet.get_all_records()
+                if str(u["telegram_id"]) == str(user_id))
+
+    now = datetime.now()
+    month = now.strftime("%Y-%m")
+
+    house_folder = get_or_create_folder(f"Дом_{user['Дом']}", ROOT_FOLDER_ID)
+    month_folder = get_or_create_folder(month, house_folder)
+
+    file = await photo.get_file()
+    data = await file.download_as_bytearray()
+
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg")
+    name = f"check_{user_id}_{int(now.timestamp())}.jpg"
+
+    uploaded = drive.files().create(
+        body={"name": name, "parents": [month_folder]},
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    amount = int(user["Сумма"]) - int(user.get("Скидка", 0) or 0)
+
+    checks_sheet.append_row([
+        int(now.timestamp()),
+        user_id,
+        user["Дом"],
+        now.strftime("%Y-%m-%d %H:%M"),
+        amount,
+        "На проверке",
+        f"https://drive.google.com/file/d/{uploaded['id']}"
+    ])
+
+    await update.message.reply_text("✅ Чек загружен", reply_markup=main_keyboard())
 
 # ================= ЗАПУСК =================
 
-async def setup_webhook():
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not render_url:
-        raise RuntimeError("❌ RENDER_EXTERNAL_URL не найден")
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    webhook_url = f"{render_url}/webhook/{WEBHOOK_SECRET}"
-    await app_tg.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET
-    )
-    logging.info(f"🔗 Webhook установлен: {webhook_url}")
+    app.add_handler(MessageHandler(filters.COMMAND, start))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.PHOTO, upload_check))
+
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(setup_webhook())
-
-    flask_app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
+    main()
