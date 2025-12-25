@@ -4,11 +4,7 @@ import logging
 import datetime
 from io import BytesIO
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,7 +23,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
 SHEET_USERS = "Лист 1"
@@ -89,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         context.user_data["reg"] = True
         await update.message.reply_text(
-            "👋 Добрый день!\nВведите ФИО, номер участка и телефон одним сообщением."
+            "👋 Введите ФИО, номер участка и телефон одним сообщением."
         )
         return
 
@@ -104,9 +100,8 @@ async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("reg"):
         return
 
-    text = update.message.text
     users_sheet.append_row([
-        "", text, update.effective_user.id, "", "", "", "", "На проверке", ""
+        "", update.message.text, update.effective_user.id, "", "", "", "", "На проверке", ""
     ])
     context.user_data.clear()
 
@@ -150,47 +145,32 @@ async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = await file.get_file()
     data = await f.download_as_bytearray()
 
-    now = datetime.datetime.now().strftime("%Y-%m")
-    folder_name = f"Чеки/{tg_id}/{now}"
-
-    folder_id = None
-    q = drive.files().list(q=f"name='{folder_name}'").execute()
-    if q["files"]:
-        folder_id = q["files"][0]["id"]
-    else:
-        folder = drive.files().create(body={
-            "name": folder_name,
-            "mimeType": "application/vnd.google-apps.folder"
-        }).execute()
-        folder_id = folder["id"]
+    folder_name = f"Чеки/{tg_id}"
+    folder = drive.files().create(body={
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder"
+    }).execute()
 
     media = MediaIoBaseUpload(BytesIO(data), resumable=True)
     drive.files().create(
-        body={"name": f"check_{tg_id}.jpg", "parents": [folder_id]},
+        body={"name": f"check_{tg_id}.jpg", "parents": [folder["id"]]},
         media_body=media
     ).execute()
 
     users_sheet.update_cell(get_user_row(tg_id)[0], 8, "На проверке")
-
     context.user_data.clear()
-    await update.message.reply_text("✅ Чек отправлен на проверку")
+
+    await update.message.reply_text("✅ Чек отправлен")
 
 # ================= АДМИН =================
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row_i = int(context.args[0])
-    users_sheet.update_cell(row_i, 8, "Принят")
+    users_sheet.update_cell(int(context.args[0]), 8, "Принят")
     await update.message.reply_text("✅ Принято")
 
 async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row_i = int(context.args[0])
-    users_sheet.update_cell(row_i, 8, "Отклонён")
+    users_sheet.update_cell(int(context.args[0]), 8, "Отклонён")
     await update.message.reply_text("❌ Отклонено")
-
-# ================= WEBHOOK =================
-
-async def on_startup(app):
-    await app.bot.set_webhook(f"{BASE_URL}/webhook")
 
 # ================= ЗАПУСК =================
 
@@ -207,8 +187,7 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=10000,
-        webhook_url=f"{BASE_URL}/webhook",
-        on_startup=on_startup
+        webhook_url=f"{BASE_URL}/webhook"
     )
 
 if __name__ == "__main__":
