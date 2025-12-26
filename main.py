@@ -2,15 +2,14 @@ import os
 import json
 import logging
 from io import BytesIO
-import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -19,7 +18,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================== НАСТРОЙКИ ==================
+# ================= НАСТРОЙКИ =================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
@@ -37,12 +36,12 @@ SCOPES = [
 if not BOT_TOKEN or not BASE_URL or not GOOGLE_CREDS_JSON:
     raise RuntimeError("❌ Не заданы переменные окружения")
 
-# ================== ЛОГИ ==================
+# ================= ЛОГИ =================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ================== GOOGLE ==================
+# ================= GOOGLE =================
 
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
@@ -54,7 +53,7 @@ rekv_sheet = sh.worksheet(SHEET_REKV)
 
 drive = build("drive", "v3", credentials=creds)
 
-# ================== ВСПОМОГАТЕЛЬНОЕ ==================
+# ================= ВСПОМОГАТЕЛЬНОЕ =================
 
 def get_user_row(tg_id):
     rows = users_sheet.get_all_records()
@@ -80,17 +79,16 @@ def main_keyboard(is_admin=False):
         )
     return InlineKeyboardMarkup(buttons)
 
-# ================== /start ==================
+# ================= START =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
-    _, row = get_user_row(tg_id)
+    row_i, row = get_user_row(tg_id)
 
     if not row:
         context.user_data["reg"] = True
         await update.message.reply_text(
-            "👋 Добро пожаловать!\n"
-            "Введите ФИО, номер участка и телефон одним сообщением."
+            "👋 Введите ФИО, номер участка и телефон одним сообщением."
         )
         return
 
@@ -99,23 +97,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(is_admin(row)),
     )
 
-# ================== РЕГИСТРАЦИЯ ==================
+# ================= РЕГИСТРАЦИЯ =================
 
 async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("reg"):
         return
 
-    users_sheet.append_row([
-        "",
-        update.message.text,
-        update.effective_user.id,
-        "",
-        "",
-        "",
-        "",
-        "На проверке",
-        "",
-    ])
+    users_sheet.append_row(
+        [
+            "",
+            update.message.text,
+            update.effective_user.id,
+            "",
+            "",
+            "",
+            "",
+            "На проверке",
+            "",
+        ]
+    )
 
     context.user_data.clear()
 
@@ -124,34 +124,59 @@ async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(),
     )
 
-# ================== КНОПКИ ==================
+# ================= КНОПКИ =================
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    _, row = get_user_row(q.from_user.id)
+    row_i, row = get_user_row(q.from_user.id)
 
+    # ---------- РЕКВИЗИТЫ ----------
     if q.data == "rekv":
-        data = rekv_sheet.get_all_records()
-        text = "\n".join(f"{r['Название']}: {r['Значение']}" for r in data)
-        await q.message.reply_text(text)
+        records = rekv_sheet.get_all_records()
 
+        if not records:
+            await q.message.reply_text(
+                "⚠️ Реквизиты пока не заполнены."
+            )
+            return
+
+        r = records[0]  # берём первую строку
+
+        text = (
+            f"💳 *Реквизиты для оплаты*\n\n"
+            f"🏦 Банк: {r.get('Банк', '-')}\n"
+            f"🔢 БИК: {r.get('БИК', '-')}\n"
+            f"💼 Счёт получателя: {r.get('Счёт получателя', '-')}\n"
+            f"👤 Получатель: {r.get('Получатель', '-')}\n"
+            f"🧾 ИНН: {r.get('ИНН', '-')}"
+        )
+
+        await q.message.reply_text(text, parse_mode="Markdown")
+
+    # ---------- СТАТУС ----------
     elif q.data == "status":
-        await q.message.reply_text(f"📊 Статус: {row.get('Статус')}")
+        await q.message.reply_text(
+            f"📊 Статус оплаты: {row.get('Статус', '—')}"
+        )
 
+    # ---------- ЗАГРУЗКА ЧЕКА ----------
     elif q.data == "upload":
         context.user_data["wait_check"] = True
-        await q.message.reply_text("📤 Отправьте фото или PDF чека")
+        await q.message.reply_text(
+            "📤 Отправьте фото или PDF чека"
+        )
 
+    # ---------- АДМИН ----------
     elif q.data == "admin" and is_admin(row):
         await q.message.reply_text(
-            "🛠 Админ-команды:\n"
+            "🛠 Используйте команды:\n"
             "/accept НОМЕР_СТРОКИ\n"
             "/reject НОМЕР_СТРОКИ"
         )
 
-# ================== ЧЕКИ ==================
+# ================= ЧЕКИ =================
 
 async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
@@ -163,36 +188,34 @@ async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
 
-    month = datetime.datetime.now().strftime("%Y-%m")
-    folder_name = f"Чеки/{tg_id}/{month}"
+    folder_name = f"Чеки_{tg_id}"
 
-    folder_id = None
-    res = drive.files().list(q=f"name='{folder_name}'").execute()
-    if res.get("files"):
-        folder_id = res["files"][0]["id"]
-    else:
-        folder = drive.files().create(body={
+    folder = drive.files().create(
+        body={
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
-        }).execute()
-        folder_id = folder["id"]
+        }
+    ).execute()
 
     media = MediaIoBaseUpload(BytesIO(data), resumable=True)
+
     drive.files().create(
         body={
-            "name": f"check_{tg_id}.jpg",
-            "parents": [folder_id],
+            "name": f"check_{tg_id}",
+            "parents": [folder["id"]],
         },
         media_body=media,
     ).execute()
 
     row_i, _ = get_user_row(tg_id)
-    users_sheet.update_cell(row_i, 8, "На проверке")
+    if row_i:
+        users_sheet.update_cell(row_i, 8, "На проверке")
 
     context.user_data.clear()
-    await update.message.reply_text("✅ Чек отправлен на проверку")
 
-# ================== АДМИН ==================
+    await update.message.reply_text("✅ Чек отправлен")
+
+# ================= АДМИН =================
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_sheet.update_cell(int(context.args[0]), 8, "Принят")
@@ -203,7 +226,7 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_sheet.update_cell(int(context.args[0]), 8, "Отклонён")
     await update.message.reply_text("❌ Отклонено")
 
-# ================== ЗАПУСК ==================
+# ================= ЗАПУСК =================
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -211,10 +234,13 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("accept", accept))
     app.add_handler(CommandHandler("reject", reject))
-
     app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_check))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, registration)
+    )
+    app.add_handler(
+        MessageHandler(filters.Document.ALL | filters.PHOTO, save_check)
+    )
 
     app.run_webhook(
         listen="0.0.0.0",
