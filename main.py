@@ -1,17 +1,17 @@
 import os
 import json
 import logging
-import datetime
 from io import BytesIO
+import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     CallbackQueryHandler,
-    filters
+    ContextTypes,
+    filters,
 )
 
 import gspread
@@ -19,7 +19,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================= НАСТРОЙКИ =================
+# ================== НАСТРОЙКИ ==================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
@@ -31,18 +31,18 @@ SHEET_REKV = "Лист 2"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
 if not BOT_TOKEN or not BASE_URL or not GOOGLE_CREDS_JSON:
     raise RuntimeError("❌ Не заданы переменные окружения")
 
-# ================= ЛОГИ =================
+# ================== ЛОГИ ==================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ================= GOOGLE =================
+# ================== GOOGLE ==================
 
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
@@ -54,7 +54,7 @@ rekv_sheet = sh.worksheet(SHEET_REKV)
 
 drive = build("drive", "v3", credentials=creds)
 
-# ================= ВСПОМОГАТЕЛЬНОЕ =================
+# ================== ВСПОМОГАТЕЛЬНОЕ ==================
 
 def get_user_row(tg_id):
     rows = users_sheet.get_all_records()
@@ -63,64 +63,78 @@ def get_user_row(tg_id):
             return i, r
     return None, None
 
+
 def is_admin(row):
     return str(row.get("Роль", "")).lower() == "админ"
+
 
 def main_keyboard(is_admin=False):
     buttons = [
         [InlineKeyboardButton("💳 Реквизиты", callback_data="rekv")],
         [InlineKeyboardButton("📤 Загрузить чек", callback_data="upload")],
-        [InlineKeyboardButton("📊 Статус оплаты", callback_data="status")]
+        [InlineKeyboardButton("📊 Статус оплаты", callback_data="status")],
     ]
     if is_admin:
-        buttons.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin")])
+        buttons.append(
+            [InlineKeyboardButton("🛠 Админ-панель", callback_data="admin")]
+        )
     return InlineKeyboardMarkup(buttons)
 
-# ================= START =================
+# ================== /start ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
-    row_i, row = get_user_row(tg_id)
+    _, row = get_user_row(tg_id)
 
     if not row:
         context.user_data["reg"] = True
         await update.message.reply_text(
-            "👋 Введите ФИО, номер участка и телефон одним сообщением."
+            "👋 Добро пожаловать!\n"
+            "Введите ФИО, номер участка и телефон одним сообщением."
         )
         return
 
     await update.message.reply_text(
         "✅ Бот готов к работе",
-        reply_markup=main_keyboard(is_admin(row))
+        reply_markup=main_keyboard(is_admin(row)),
     )
 
-# ================= РЕГИСТРАЦИЯ =================
+# ================== РЕГИСТРАЦИЯ ==================
 
 async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("reg"):
         return
 
     users_sheet.append_row([
-        "", update.message.text, update.effective_user.id, "", "", "", "", "На проверке", ""
+        "",
+        update.message.text,
+        update.effective_user.id,
+        "",
+        "",
+        "",
+        "",
+        "На проверке",
+        "",
     ])
+
     context.user_data.clear()
 
     await update.message.reply_text(
         "✅ Данные сохранены",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(),
     )
 
-# ================= КНОПКИ =================
+# ================== КНОПКИ ==================
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    row_i, row = get_user_row(q.from_user.id)
+    _, row = get_user_row(q.from_user.id)
 
     if q.data == "rekv":
         data = rekv_sheet.get_all_records()
-        text = "\n".join([f"{r['Название']}: {r['Значение']}" for r in data])
+        text = "\n".join(f"{r['Название']}: {r['Значение']}" for r in data)
         await q.message.reply_text(text)
 
     elif q.data == "status":
@@ -131,9 +145,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("📤 Отправьте фото или PDF чека")
 
     elif q.data == "admin" and is_admin(row):
-        await q.message.reply_text("🛠 Используйте /accept ID или /reject ID")
+        await q.message.reply_text(
+            "🛠 Админ-команды:\n"
+            "/accept НОМЕР_СТРОКИ\n"
+            "/reject НОМЕР_СТРОКИ"
+        )
 
-# ================= ЧЕКИ =================
+# ================== ЧЕКИ ==================
 
 async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
@@ -142,37 +160,50 @@ async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = update.message.document or update.message.photo[-1]
     tg_id = update.effective_user.id
 
-    f = await file.get_file()
-    data = await f.download_as_bytearray()
+    tg_file = await file.get_file()
+    data = await tg_file.download_as_bytearray()
 
-    folder_name = f"Чеки/{tg_id}"
-    folder = drive.files().create(body={
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder"
-    }).execute()
+    month = datetime.datetime.now().strftime("%Y-%m")
+    folder_name = f"Чеки/{tg_id}/{month}"
+
+    folder_id = None
+    res = drive.files().list(q=f"name='{folder_name}'").execute()
+    if res.get("files"):
+        folder_id = res["files"][0]["id"]
+    else:
+        folder = drive.files().create(body={
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }).execute()
+        folder_id = folder["id"]
 
     media = MediaIoBaseUpload(BytesIO(data), resumable=True)
     drive.files().create(
-        body={"name": f"check_{tg_id}.jpg", "parents": [folder["id"]]},
-        media_body=media
+        body={
+            "name": f"check_{tg_id}.jpg",
+            "parents": [folder_id],
+        },
+        media_body=media,
     ).execute()
 
-    users_sheet.update_cell(get_user_row(tg_id)[0], 8, "На проверке")
+    row_i, _ = get_user_row(tg_id)
+    users_sheet.update_cell(row_i, 8, "На проверке")
+
     context.user_data.clear()
+    await update.message.reply_text("✅ Чек отправлен на проверку")
 
-    await update.message.reply_text("✅ Чек отправлен")
-
-# ================= АДМИН =================
+# ================== АДМИН ==================
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_sheet.update_cell(int(context.args[0]), 8, "Принят")
     await update.message.reply_text("✅ Принято")
 
+
 async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_sheet.update_cell(int(context.args[0]), 8, "Отклонён")
     await update.message.reply_text("❌ Отклонено")
 
-# ================= ЗАПУСК =================
+# ================== ЗАПУСК ==================
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -180,6 +211,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("accept", accept))
     app.add_handler(CommandHandler("reject", reject))
+
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_check))
@@ -187,7 +219,8 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=10000,
-        webhook_url=f"{BASE_URL}/webhook"
+        url_path="webhook",
+        webhook_url=f"{BASE_URL}/webhook",
     )
 
 if __name__ == "__main__":
