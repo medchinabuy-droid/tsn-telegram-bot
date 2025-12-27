@@ -30,7 +30,7 @@ BASE_URL = os.getenv("BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-SPREADSHEET_ID = "ВАШ_ID_ТАБЛИЦЫ"
+SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
 
 SHEET_MAIN = "Лист 1"   # рассылки
 SHEET_USERS = "Лист 2"  # пользователи + чеки
