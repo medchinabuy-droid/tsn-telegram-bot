@@ -1,227 +1,189 @@
-import os
-import json
+import logging
 import datetime
-import re
-import pytz
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-
-# ================== ENV ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
-TIMEZONE = pytz.timezone("Europe/Moscow")
-
-# ================== GOOGLE SHEETS ==================
-creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-
-creds = Credentials.from_service_account_info(
-    creds_info,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
 )
 
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
+# ================== НАСТРОЙКИ ==================
 
-sheet_users = sh.worksheet("Лист 2")     # пользователи + чеки
-sheet_notify = sh.worksheet("Лист 1")    # рассылки / статусы
-sheet_rekv = sh.worksheet("Реквизиты")   # реквизиты
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 
+GOOGLE_CREDS_FILE = "credentials.json"
+SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
 
-# ================== HELPERS ==================
-def find_user_row(telegram_id):
-    ids = sheet_users.col_values(1)
-    if str(telegram_id) in ids:
-        return ids.index(str(telegram_id)) + 1
+USERS_SHEET_NAME = "Лист 1"
+CHECKS_SHEET_NAME = "Лист 2"
+
+# Состояния диалога
+ASK_FIO, ASK_HOUSE, ASK_PHONE, ASK_CHECK = range(4)
+
+logging.basicConfig(level=logging.INFO)
+
+# ================== GOOGLE SHEETS ==================
+
+def get_sheets():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(
+        GOOGLE_CREDS_FILE, scopes=scopes
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    return (
+        sh.worksheet(USERS_SHEET_NAME),
+        sh.worksheet(CHECKS_SHEET_NAME),
+    )
+
+# ================== УТИЛИТЫ ==================
+
+def find_user(users_sheet, telegram_id):
+    rows = users_sheet.get_all_records()
+    for row in rows:
+        if str(row.get("Telegram_ID")) == str(telegram_id):
+            return row
     return None
 
-
-def extract_amount(text: str):
-    matches = re.findall(r"\b\d{2,6}[.,]\d{2}\b", text.replace(" ", ""))
-    if matches:
-        return matches[0].replace(",", ".")
-    return ""
-
-
-# ================== START ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    row = find_user_row(user.id)
-    if not row:
-        sheet_users.append_row([
-            user.id,
-            user.username or "",
-            "",
-            "",
-            "",
-            "",
-        ])
-
-    keyboard = [
-        [InlineKeyboardButton("💳 Реквизиты", callback_data="rekv")],
-        [InlineKeyboardButton("📤 Отправить чек", callback_data="send_check")],
-    ]
-
-    await update.message.reply_text(
-        "👋 Добро пожаловать!\n\n"
-        "Используйте кнопки ниже:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ================== BUTTONS ==================
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "rekv":
-        rows = sheet_rekv.get_all_values()
-        text = "💳 *Реквизиты:*\n\n"
-        for r in rows[1:]:
-            text += f"{r[0]}: {r[1]}\n"
-        await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif query.data == "send_check":
-        await query.message.reply_text(
-            "📸 Отправьте фото или PDF чека"
-        )
-
-
-# ================== REGISTRATION ==================
-async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-
-    row = find_user_row(user_id)
-    if not row:
-        return
-
-    current = sheet_users.row_values(row)
-    while len(current) < 6:
-        current.append("")
-
-    if not current[2]:
-        current[2] = text
-        sheet_users.update(f"C{row}", text)
-        await update.message.reply_text("Введите номер дома:")
-        return
-
-    if not current[3]:
-        current[3] = text
-        sheet_users.update(f"D{row}", text)
-        await update.message.reply_text("Введите телефон:")
-        return
-
-    if not current[4]:
-        current[4] = text
-        sheet_users.update(f"E{row}", text)
-        await update.message.reply_text("Спасибо! Данные сохранены ✅")
-        return
-
-
-# ================== SAVE CHECK ==================
-async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row = find_user_row(user.id)
-    if not row:
-        return
-
-    link = ""
-    text_ocr = ""
-
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-        link = file.file_path
-
-    if update.message.document:
-        file = await update.message.document.get_file()
-        link = file.file_path
-
-    amount = extract_amount(update.message.caption or "")
-
-    sheet_users.update(f"F{row}", link)
-
-    sheet_notify.append_row([
-        user.username,
-        user.id,
-        amount,
-        datetime.datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M"),
-        "На проверке",
-        "",
-        "",
+def add_user(users_sheet, fio, house, phone, telegram_id):
+    users_sheet.append_row([
+        house,
+        fio,
+        telegram_id,
+        phone
     ])
 
+def add_check(checks_sheet, data: dict):
+    checks_sheet.append_row([
+        data.get("telegram_id"),
+        data.get("username"),
+        data.get("fio"),
+        data.get("house"),
+        data.get("phone"),
+        data.get("check_link"),
+        data.get("amount"),
+        data.get("date"),
+        "",
+        "",
+        data.get("file_id"),
+    ])
+
+# ================== КОМАНДЫ ==================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📎 Отправить чек")]],
+        resize_keyboard=True
+    )
     await update.message.reply_text(
-        "✅ Чек получен и отправлен на проверку"
+        "Здравствуйте! Выберите действие:",
+        reply_markup=keyboard
     )
 
+async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users_sheet, _ = get_sheets()
 
-# ================== REMINDERS ==================
-async def reminders(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.datetime.now(TIMEZONE).day
-    rows = sheet_notify.get_all_values()
+    user = update.effective_user
+    found = find_user(users_sheet, user.id)
 
-    for i, r in enumerate(rows[1:], start=2):
-        try:
-            day_pay = int(r[4])
-        except:
-            continue
+    context.user_data["telegram_id"] = user.id
+    context.user_data["username"] = user.username
 
-        if day_pay == today and r[-1] != "Отправлено":
-            try:
-                await context.bot.send_message(
-                    chat_id=r[1],
-                    text="🔔 Напоминание об оплате"
-                )
-                sheet_notify.update(f"H{i}", "Отправлено")
-            except:
-                sheet_notify.update(f"H{i}", "Ошибка")
+    if found:
+        context.user_data["fio"] = found.get("ФИО")
+        context.user_data["house"] = found.get("Участок")
+        context.user_data["phone"] = found.get("Телефон")
 
+        await update.message.reply_text(
+            "Пользователь найден. Пришлите фото или PDF чека."
+        )
+        return ASK_CHECK
+    else:
+        await update.message.reply_text("Введите ФИО:")
+        return ASK_FIO
+
+async def ask_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["fio"] = update.message.text.strip()
+    await update.message.reply_text("Введите номер дома / участка:")
+    return ASK_HOUSE
+
+async def ask_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["house"] = update.message.text.strip()
+    await update.message.reply_text("Введите телефон:")
+    return ASK_PHONE
+
+async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text("Теперь пришлите чек (фото или PDF):")
+    return ASK_CHECK
+
+async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users_sheet, checks_sheet = get_sheets()
+
+    file = None
+    if update.message.photo:
+        file = update.message.photo[-1]
+    elif update.message.document:
+        file = update.message.document
+
+    if not file:
+        await update.message.reply_text("Пожалуйста, отправьте файл чека.")
+        return ASK_CHECK
+
+    context.user_data["file_id"] = file.file_unique_id
+    context.user_data["check_link"] = file.file_id
+    context.user_data["date"] = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # если пользователь новый — сохраняем в Лист 1
+    if not find_user(users_sheet, context.user_data["telegram_id"]):
+        add_user(
+            users_sheet,
+            context.user_data["fio"],
+            context.user_data["house"],
+            context.user_data["phone"],
+            context.user_data["telegram_id"]
+        )
+
+    add_check(checks_sheet, context.user_data)
+
+    await update.message.reply_text("✅ Чек успешно сохранён. Спасибо!")
+    return ConversationHandler.END
 
 # ================== MAIN ==================
+
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^📎 Отправить чек$"), send_check_start)
+        ],
+        states={
+            ASK_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_fio)],
+            ASK_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_house)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            ASK_CHECK: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, receive_check)
+            ],
+        },
+        fallbacks=[],
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_check))
+    app.add_handler(conv)
 
-    app.job_queue.run_daily(
-        reminders,
-        time=datetime.time(hour=9, minute=0)
-    )
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url=BASE_URL,
-        secret_token=WEBHOOK_SECRET,
-    )
-
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
