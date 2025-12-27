@@ -1,29 +1,41 @@
 import os
 import json
 import logging
+import datetime
+import re
 from io import BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, CallbackQueryHandler, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
 )
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
+from telegram.error import Forbidden
 
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================= НАСТРОЙКИ =================
+# ================== НАСТРОЙКИ ==================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BASE_URL = os.getenv("BASE_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
 
-SHEET_USERS = "Лист 1"
-SHEET_CHECKS = "Лист 2"
+SHEET_MAIN = "Лист 1"
+SHEET_USERS = "Лист 2"
 SHEET_REKV = "Реквизиты"
 
 SCOPES = [
@@ -31,32 +43,44 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-# ================= ЛОГИ =================
+if not all([BOT_TOKEN, BASE_URL, WEBHOOK_SECRET, GOOGLE_CREDS_JSON]):
+    raise RuntimeError("❌ Не заданы переменные окружения")
+
+# ================== ЛОГИ ==================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ================= GOOGLE =================
+# ================== GOOGLE ==================
 
 creds = Credentials.from_service_account_info(
-    json.loads(GOOGLE_CREDS_JSON), scopes=SCOPES
+    json.loads(GOOGLE_CREDS_JSON),
+    scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
-users_sheet = sh.worksheet(SHEET_USERS)
-checks_sheet = sh.worksheet(SHEET_CHECKS)
-rekv_sheet = sh.worksheet(SHEET_REKV)
+sheet_main = sh.worksheet(SHEET_MAIN)
+sheet_users = sh.worksheet(SHEET_USERS)
+sheet_rekv = sh.worksheet(SHEET_REKV)
 
 drive = build("drive", "v3", credentials=creds)
 
-# ================= ВСПОМОГАТЕЛЬНОЕ =================
+# ================== ВСПОМОГАТЕЛЬНОЕ ==================
 
-def find_user(tg_id):
-    rows = users_sheet.get_all_records()
+def get_user_main(tg_id):
+    rows = sheet_main.get_all_records()
     for i, r in enumerate(rows, start=2):
         if str(r.get("Telegram_ID")) == str(tg_id):
+            return i, r
+    return None, None
+
+
+def get_user_users(tg_id):
+    rows = sheet_users.get_all_records()
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("telegram_id")) == str(tg_id):
             return i, r
     return None, None
 
@@ -65,126 +89,160 @@ def is_admin(row):
     return str(row.get("Роль", "")).lower() == "админ"
 
 
-def keyboard(is_admin=False):
+def main_keyboard(admin=False):
     kb = [
         [InlineKeyboardButton("💳 Реквизиты", callback_data="rekv")],
         [InlineKeyboardButton("📤 Загрузить чек", callback_data="upload")],
-        [InlineKeyboardButton("📊 Статус", callback_data="status")]
+        [InlineKeyboardButton("📊 Статус оплаты", callback_data="status")]
     ]
-    if is_admin:
+    if admin:
         kb.append([InlineKeyboardButton("🛠 Админ", callback_data="admin")])
     return InlineKeyboardMarkup(kb)
 
-# ================= START =================
+# ================== START / РЕГИСТРАЦИЯ ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    row_i, row = find_user(tg_id)
+    tg = update.effective_user
+    row_i, row = get_user_users(tg.id)
 
     if not row:
         context.user_data["reg"] = True
         await update.message.reply_text(
-            "👋 Вас нет в базе.\n"
-            "Введите: ФИО, номер дома, телефон\n"
-            "одним сообщением."
+            "👋 Введите одним сообщением:\nФИО, номер участка, телефон"
         )
         return
 
+    _, main_row = get_user_main(tg.id)
     await update.message.reply_text(
-        "✅ Добро пожаловать",
-        reply_markup=keyboard(is_admin(row))
+        "✅ Бот готов к работе",
+        reply_markup=main_keyboard(is_admin(main_row) if main_row else False)
     )
 
-# ================= РЕГИСТРАЦИЯ =================
 
 async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("reg"):
         return
 
-    text = update.message.text
     tg = update.effective_user
+    text = update.message.text
 
-    users_sheet.append_row([
-        "", text, tg.id, "", "", "", "", "", "Активен", "", ""
+    sheet_users.append_row([
+        tg.id,
+        tg.username or "",
+        text,
+        "",
+        "",
+        "",
+        "",
+        ""
     ])
 
     context.user_data.clear()
+    await update.message.reply_text("✅ Данные сохранены")
 
-    await update.message.reply_text(
-        "✅ Данные сохранены",
-        reply_markup=keyboard()
-    )
-
-# ================= КНОПКИ =================
+# ================== КНОПКИ ==================
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    row_i, row = find_user(q.from_user.id)
-
     if q.data == "rekv":
-        r = rekv_sheet.get_all_records()[0]
+        data = sheet_rekv.get_all_records()
+        if not data:
+            await q.message.reply_text("❌ Реквизиты не заполнены")
+            return
+
+        r = data[0]
         text = (
-            f"💳 *Реквизиты*\n\n"
             f"🏦 Банк: {r['Банк']}\n"
             f"🔢 БИК: {r['БИК']}\n"
-            f"💼 Счёт: {r['Счёт получателя']}\n"
+            f"💳 Счёт: {r['Счёт получателя']}\n"
             f"👤 Получатель: {r['Получатель']}\n"
             f"🧾 ИНН: {r['ИНН']}"
         )
-        await q.message.reply_text(text, parse_mode="Markdown")
-
-    elif q.data == "status":
-        await q.message.reply_text(
-            f"📊 Статус: {row.get('Статус', '—')}"
-        )
+        await q.message.reply_text(text)
 
     elif q.data == "upload":
         context.user_data["wait_check"] = True
-        await q.message.reply_text("📤 Пришлите фото или PDF чека")
+        await q.message.reply_text("📎 Отправьте фото или PDF чека")
 
-# ================= ЧЕК =================
+    elif q.data == "status":
+        _, row = get_user_main(q.from_user.id)
+        await q.message.reply_text(f"📊 Статус: {row.get('Статус','—')}")
+
+    elif q.data == "admin":
+        await q.message.reply_text("📊 Отчёт формируется… (в разработке)")
+
+# ================== OCR ЧЕКОВ ==================
+
+def extract_sum(text):
+    m = re.search(r"(\d{1,5}[.,]\d{2})", text)
+    return m.group(1) if m else ""
+
 
 async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
         return
 
     tg = update.effective_user
-    row_i, row = find_user(tg.id)
-
     file = update.message.document or update.message.photo[-1]
-    tg_file = await file.get_file()
-    data = await tg_file.download_as_bytearray()
+    f = await file.get_file()
+    data = await f.download_as_bytearray()
 
-    folder = drive.files().create(
-        body={"name": f"Чеки_{tg.id}", "mimeType": "application/vnd.google-apps.folder"}
-    ).execute()
+    folder = drive.files().create(body={
+        "name": f"checks_{tg.id}",
+        "mimeType": "application/vnd.google-apps.folder"
+    }).execute()
 
     media = MediaIoBaseUpload(BytesIO(data), resumable=True)
-
     uploaded = drive.files().create(
-        body={"name": "check", "parents": [folder["id"]]},
+        body={"name": f"check_{tg.id}.pdf", "parents": [folder["id"]]},
         media_body=media
     ).execute()
 
     link = f"https://drive.google.com/file/d/{uploaded['id']}"
 
-    checks_sheet.append_row([
-        tg.id,
-        tg.username,
-        row.get("ФИО"),
-        row.get("Участок"),
-        row.get("Телефон"),
-        link
+    row_i, _ = get_user_users(tg.id)
+    sheet_users.update(row_i, [
+        [tg.id, tg.username or "", "", "", "", link, "", ""]
     ])
 
-    users_sheet.update_cell(row_i, 9, "На проверке")
     context.user_data.clear()
+    await update.message.reply_text("✅ Чек получен и отправлен на проверку")
 
-    await update.message.reply_text("✅ Чек принят на проверку")
+# ================== НАПОМИНАНИЯ ==================
 
-# ================= ЗАПУСК =================
+async def check_payments(app: Application):
+    today = datetime.date.today().day
+    rows = sheet_main.get_all_records()
+
+    for i, r in enumerate(rows, start=2):
+        try:
+            pay_day = int(r.get("День_оплаты", 0))
+            if pay_day == today and r.get("Напоминание_отправлено") != "Да":
+                try:
+                    await app.bot.send_message(
+                        r["Telegram_ID"],
+                        "🔔 Сегодня день оплаты взноса"
+                    )
+                    sheet_main.update_cell(i, 12, "Да")
+                    sheet_main.update_cell(i, 13, str(datetime.datetime.now()))
+                    sheet_main.update_cell(i, 14, "Доставлено")
+                except Forbidden:
+                    sheet_main.update_cell(i, 14, "Бот заблокирован")
+        except Exception as e:
+            sheet_main.update_cell(i, 11, str(e))
+
+# ================== WEBHOOK ==================
+
+async def on_startup(app: Application):
+    await app.bot.set_webhook(
+        url=f"{BASE_URL}/webhook",
+        secret_token=WEBHOOK_SECRET
+    )
+    await check_payments(app)
+
+# ================== ЗАПУСК ==================
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -198,7 +256,9 @@ def main():
         listen="0.0.0.0",
         port=10000,
         url_path="webhook",
-        webhook_url=f"{BASE_URL}/webhook"
+        webhook_url=f"{BASE_URL}/webhook",
+        secret_token=WEBHOOK_SECRET,
+        on_startup=on_startup
     )
 
 if __name__ == "__main__":
