@@ -1,6 +1,7 @@
-import os
 import logging
 import datetime
+import os
+import asyncio
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -22,24 +23,17 @@ from telegram.ext import (
 # ================== НАСТРОЙКИ ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не найден в переменных окружения")
-if not SPREADSHEET_ID:
-    raise RuntimeError("❌ SPREADSHEET_ID не найден")
-if not GOOGLE_CREDS_JSON:
-    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON не найден")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 USERS_SHEET_NAME = "Лист 1"
 CHECKS_SHEET_NAME = "Лист 2"
 
-# Состояния диалога
 ASK_FIO, ASK_HOUSE, ASK_PHONE, ASK_CHECK = range(4)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ================== GOOGLE SHEETS ==================
 
@@ -47,8 +41,8 @@ def get_sheets():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
     creds = Credentials.from_service_account_info(
-        eval(GOOGLE_CREDS_JSON),
-        scopes=scopes
+        eval(GOOGLE_CREDENTIALS_JSON),
+        scopes=scopes,
     )
 
     gc = gspread.authorize(creds)
@@ -73,7 +67,7 @@ def add_user(users_sheet, fio, house, phone, telegram_id):
         house,
         fio,
         telegram_id,
-        phone
+        phone,
     ])
 
 def add_check(checks_sheet, data: dict):
@@ -109,7 +103,6 @@ async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     found = find_user(users_sheet, user.id)
 
-    context.user_data.clear()
     context.user_data["telegram_id"] = user.id
     context.user_data["username"] = user.username
 
@@ -174,10 +167,12 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 
-def main():
-    logger.info("🚀 Bot starting...")
-
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # 🔥 КРИТИЧЕСКИ ВАЖНО
+    # удаляем webhook, иначе polling не запустится
+    await app.bot.delete_webhook(drop_pending_updates=True)
 
     conv = ConversationHandler(
         entry_points=[
@@ -197,7 +192,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
