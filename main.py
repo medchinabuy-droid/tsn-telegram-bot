@@ -1,7 +1,6 @@
 import logging
 import datetime
 import os
-import asyncio
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,9 +22,7 @@ from telegram.ext import (
 # ================== НАСТРОЙКИ ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 USERS_SHEET_NAME = "Лист 1"
@@ -78,7 +75,7 @@ def add_check(checks_sheet, data: dict):
         data.get("house"),
         data.get("phone"),
         data.get("check_link"),
-        data.get("amount", ""),
+        "",
         data.get("date"),
         "",
         "",
@@ -165,14 +162,21 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Чек успешно сохранён. Спасибо!")
     return ConversationHandler.END
 
+# ================== WEBHOOK CLEANUP ==================
+
+async def post_init(application):
+    # 🔥 УДАЛЯЕМ webhook, иначе polling не работает
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 # ================== MAIN ==================
 
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # 🔥 КРИТИЧЕСКИ ВАЖНО
-    # удаляем webhook, иначе polling не запустится
-    await app.bot.delete_webhook(drop_pending_updates=True)
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
@@ -192,7 +196,8 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    await app.run_polling()
+    # ❗ БЕЗ await
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
