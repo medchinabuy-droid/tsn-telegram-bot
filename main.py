@@ -1,3 +1,4 @@
+import os
 import logging
 import datetime
 
@@ -20,10 +21,16 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-GOOGLE_CREDS_FILE = "credentials.json"
-SPREADSHEET_ID = "1JNf6fRup9bS_Bi_05XzBDbU3aqDhq6Dtt2rxlOp1EPE"
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не найден в переменных окружения")
+if not SPREADSHEET_ID:
+    raise RuntimeError("❌ SPREADSHEET_ID не найден")
+if not GOOGLE_CREDS_JSON:
+    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON не найден")
 
 USERS_SHEET_NAME = "Лист 1"
 CHECKS_SHEET_NAME = "Лист 2"
@@ -32,16 +39,21 @@ CHECKS_SHEET_NAME = "Лист 2"
 ASK_FIO, ASK_HOUSE, ASK_PHONE, ASK_CHECK = range(4)
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ================== GOOGLE SHEETS ==================
 
 def get_sheets():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(
-        GOOGLE_CREDS_FILE, scopes=scopes
+
+    creds = Credentials.from_service_account_info(
+        eval(GOOGLE_CREDS_JSON),
+        scopes=scopes
     )
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
+
     return (
         sh.worksheet(USERS_SHEET_NAME),
         sh.worksheet(CHECKS_SHEET_NAME),
@@ -72,7 +84,7 @@ def add_check(checks_sheet, data: dict):
         data.get("house"),
         data.get("phone"),
         data.get("check_link"),
-        data.get("amount"),
+        data.get("amount", ""),
         data.get("date"),
         "",
         "",
@@ -97,6 +109,7 @@ async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     found = find_user(users_sheet, user.id)
 
+    context.user_data.clear()
     context.user_data["telegram_id"] = user.id
     context.user_data["username"] = user.username
 
@@ -145,7 +158,6 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["check_link"] = file.file_id
     context.user_data["date"] = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # если пользователь новый — сохраняем в Лист 1
     if not find_user(users_sheet, context.user_data["telegram_id"]):
         add_user(
             users_sheet,
@@ -163,6 +175,8 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== MAIN ==================
 
 def main():
+    logger.info("🚀 Bot starting...")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
