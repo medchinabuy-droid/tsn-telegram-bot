@@ -1,6 +1,6 @@
+import os
 import logging
 import datetime
-import os
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -19,18 +19,28 @@ from telegram.ext import (
     filters,
 )
 
+# ================== ЛОГИ ==================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 # ================== НАСТРОЙКИ ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 USERS_SHEET_NAME = "Лист 1"
 CHECKS_SHEET_NAME = "Лист 2"
 
-ASK_FIO, ASK_HOUSE, ASK_PHONE, ASK_CHECK = range(4)
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не задан в переменных окружения")
 
-logging.basicConfig(level=logging.INFO)
+# ================== СОСТОЯНИЯ ==================
+
+ASK_FIO, ASK_HOUSE, ASK_PHONE, ASK_CHECK = range(4)
 
 # ================== GOOGLE SHEETS ==================
 
@@ -38,7 +48,7 @@ def get_sheets():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
     creds = Credentials.from_service_account_info(
-        eval(GOOGLE_CREDENTIALS_JSON),
+        eval(GOOGLE_CREDS_JSON),
         scopes=scopes,
     )
 
@@ -59,12 +69,20 @@ def find_user(users_sheet, telegram_id):
             return row
     return None
 
+def is_duplicate_check(checks_sheet, file_unique_id):
+    rows = checks_sheet.get_all_records()
+    for row in rows:
+        if row.get("File_Unique_ID") == file_unique_id:
+            return True
+    return False
+
 def add_user(users_sheet, fio, house, phone, telegram_id):
     users_sheet.append_row([
-        house,
-        fio,
-        telegram_id,
-        phone,
+        house,           # Участок
+        fio,             # ФИО
+        telegram_id,     # Telegram_ID
+        phone,           # Телефон
+        "", "", "", "", "", "", "", "", "", ""
     ])
 
 def add_check(checks_sheet, data: dict):
@@ -75,11 +93,11 @@ def add_check(checks_sheet, data: dict):
         data.get("house"),
         data.get("phone"),
         data.get("check_link"),
-        "",
+        data.get("amount", ""),
         data.get("date"),
-        "",
-        "",
-        data.get("file_id"),
+        data.get("ocr", ""),
+        data.get("double", ""),
+        data.get("file_unique_id"),
     ])
 
 # ================== КОМАНДЫ ==================
@@ -90,7 +108,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resize_keyboard=True
     )
     await update.message.reply_text(
-        "Здравствуйте! Выберите действие:",
+        "Здравствуйте!\nНажмите кнопку ниже, чтобы отправить чек.",
         reply_markup=keyboard
     )
 
@@ -98,10 +116,12 @@ async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_sheet, _ = get_sheets()
 
     user = update.effective_user
-    found = find_user(users_sheet, user.id)
 
+    context.user_data.clear()
     context.user_data["telegram_id"] = user.id
     context.user_data["username"] = user.username
+
+    found = find_user(users_sheet, user.id)
 
     if found:
         context.user_data["fio"] = found.get("ФИО")
@@ -109,7 +129,7 @@ async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["phone"] = found.get("Телефон")
 
         await update.message.reply_text(
-            "Пользователь найден. Пришлите фото или PDF чека."
+            "Пользователь найден.\nПришлите фото или PDF чека."
         )
         return ASK_CHECK
     else:
@@ -118,7 +138,7 @@ async def send_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fio"] = update.message.text.strip()
-    await update.message.reply_text("Введите номер дома / участка:")
+    await update.message.reply_text("Введите номер участка / дома:")
     return ASK_HOUSE
 
 async def ask_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -128,7 +148,7 @@ async def ask_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("Теперь пришлите чек (фото или PDF):")
+    await update.message.reply_text("Теперь отправьте чек (фото или PDF):")
     return ASK_CHECK
 
 async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,10 +161,16 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = update.message.document
 
     if not file:
-        await update.message.reply_text("Пожалуйста, отправьте файл чека.")
+        await update.message.reply_text("❌ Пришлите фото или PDF файл.")
         return ASK_CHECK
 
-    context.user_data["file_id"] = file.file_unique_id
+    file_unique_id = file.file_unique_id
+
+    if is_duplicate_check(checks_sheet, file_unique_id):
+        await update.message.reply_text("⚠️ Этот чек уже был отправлен ранее.")
+        return ConversationHandler.END
+
+    context.user_data["file_unique_id"] = file_unique_id
     context.user_data["check_link"] = file.file_id
     context.user_data["date"] = datetime.datetime.now().strftime("%Y-%m-%d")
 
@@ -159,24 +185,13 @@ async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_check(checks_sheet, context.user_data)
 
-    await update.message.reply_text("✅ Чек успешно сохранён. Спасибо!")
+    await update.message.reply_text("✅ Чек принят и сохранён. Спасибо!")
     return ConversationHandler.END
-
-# ================== WEBHOOK CLEANUP ==================
-
-async def post_init(application):
-    # 🔥 УДАЛЯЕМ webhook, иначе polling не работает
-    await application.bot.delete_webhook(drop_pending_updates=True)
 
 # ================== MAIN ==================
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -196,8 +211,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    # ❗ БЕЗ await
-    app.run_polling()
+    logging.info("🤖 Бот запущен (polling)")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
