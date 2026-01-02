@@ -33,19 +33,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= APP =================
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-
     return app
 
 # ================= ENTRY =================
 if __name__ == "__main__":
     app = build_app()
 
-    # ⛔ гарантированно убираем webhook
-    app.bot.delete_webhook(drop_pending_updates=True)
-
-    # ▶️ запускаем polling
+    # ▶️ запускаем polling (БЕЗ delete_webhook)
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
