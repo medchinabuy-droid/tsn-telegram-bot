@@ -2,48 +2,38 @@ import os
 import logging
 from flask import Flask, request, abort
 
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ================== ЛОГИ ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BASE_URL = os.getenv("BASE_URL")          # ← ВАЖНО
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-if not BOT_TOKEN or not WEBHOOK_URL or not WEBHOOK_SECRET:
-    raise RuntimeError("❌ Не заданы BOT_TOKEN / WEBHOOK_URL / WEBHOOK_SECRET")
+logger.info(f"BOT_TOKEN set: {bool(BOT_TOKEN)}")
+logger.info(f"BASE_URL set: {bool(BASE_URL)}")
+logger.info(f"WEBHOOK_SECRET set: {bool(WEBHOOK_SECRET)}")
+
+if not BOT_TOKEN or not BASE_URL or not WEBHOOK_SECRET:
+    raise RuntimeError("❌ Не заданы BOT_TOKEN / BASE_URL / WEBHOOK_SECRET")
 
 # ================== FLASK ==================
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
 # ================== TELEGRAM ==================
 application = Application.builder().token(BOT_TOKEN).build()
 
-# ---------- handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📤 Отправить чек")]],
-        resize_keyboard=True,
-    )
-    await update.message.reply_text(
-        "🤖 Бот запущен через WEBHOOK и работает!\n\nВыберите действие:",
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text("✅ Бот работает через WEBHOOK на Render")
 
 application.add_handler(CommandHandler("start", start))
 
-# ================== WEBHOOK ROUTE ==================
-@flask_app.post(f"/webhook/{WEBHOOK_SECRET}")
+# ================== WEBHOOK ==================
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def telegram_webhook():
     if request.headers.get("content-type") != "application/json":
         abort(403)
@@ -53,26 +43,21 @@ async def telegram_webhook():
     return "OK"
 
 # ================== INIT ==================
-async def setup_webhook():
+async def setup():
+    await application.initialize()
     await application.bot.set_webhook(
-        url=f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}",
+        url=f"{BASE_URL}/webhook/{WEBHOOK_SECRET}",
         drop_pending_updates=True,
     )
-    logging.info("✅ Webhook установлен")
+    logger.info("✅ Webhook установлен")
+    await application.start()
 
-# ================== ENTRY ==================
 if __name__ == "__main__":
     import asyncio
 
-    async def main():
-        await application.initialize()
-        await setup_webhook()
-        await application.start()
+    asyncio.run(setup())
 
-    asyncio.run(main())
-
-    # Render сам прокидывает PORT
-    flask_app.run(
+    app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000)),
     )
