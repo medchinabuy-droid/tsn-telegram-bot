@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")  # БЕЗ /webhook
+BASE_URL = os.getenv("BASE_URL")  # без /webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+PORT = int(os.environ.get("PORT", 10000))
 
 if not BOT_TOKEN or not BASE_URL or not WEBHOOK_SECRET:
     raise RuntimeError("❌ ENV variables missing")
@@ -37,7 +38,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🤖 Бот запущен и работает.\nНажмите кнопку ниже 👇",
+        "🤖 Бот запущен и работает.\n\nНажмите кнопку ниже 👇",
         reply_markup=keyboard
     )
 
@@ -50,15 +51,11 @@ app = Flask(__name__)
 def webhook():
     logger.info("📩 Webhook POST received")
 
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != WEBHOOK_SECRET:
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         logger.warning("❌ Wrong secret token")
         abort(403)
 
-    update = Update.de_json(
-        request.get_json(force=True),
-        telegram_app.bot
-    )
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
 
     asyncio.run_coroutine_threadsafe(
         telegram_app.process_update(update),
@@ -74,11 +71,8 @@ def index():
 # ================= START =================
 async def startup():
     await telegram_app.initialize()
-
-    # ВАЖНО: сначала снести старый webhook
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
 
-    # Потом поставить новый
     await telegram_app.bot.set_webhook(
         url=f"{BASE_URL}/webhook",
         secret_token=WEBHOOK_SECRET
@@ -89,4 +83,4 @@ async def startup():
 
 if __name__ == "__main__":
     loop.run_until_complete(startup())
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=PORT)
