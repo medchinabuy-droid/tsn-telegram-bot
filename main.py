@@ -4,11 +4,7 @@ import asyncio
 from flask import Flask, request, abort
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= ЛОГИ =================
 logging.basicConfig(level=logging.INFO)
@@ -16,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")
+BASE_URL = os.getenv("BASE_URL")  # БЕЗ /webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not BOT_TOKEN or not BASE_URL or not WEBHOOK_SECRET:
@@ -41,8 +37,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🤖 Бот запущен и работает!\n\nНажмите кнопку ниже 👇",
-        reply_markup=keyboard,
+        "🤖 Бот запущен и работает.\nНажмите кнопку ниже 👇",
+        reply_markup=keyboard
     )
 
 telegram_app.add_handler(CommandHandler("start", start))
@@ -50,10 +46,13 @@ telegram_app.add_handler(CommandHandler("start", start))
 # ================= FLASK =================
 app = Flask(__name__)
 
-@app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
+    logger.info("📩 Webhook POST received")
+
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if secret != WEBHOOK_SECRET:
+        logger.warning("❌ Wrong secret token")
         abort(403)
 
     update = Update.de_json(
@@ -75,12 +74,18 @@ def index():
 # ================= START =================
 async def startup():
     await telegram_app.initialize()
+
+    # ВАЖНО: сначала снести старый webhook
+    await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+
+    # Потом поставить новый
     await telegram_app.bot.set_webhook(
-        url=BASE_URL,
+        url=f"{BASE_URL}/webhook",
         secret_token=WEBHOOK_SECRET
     )
+
     await telegram_app.start()
-    logger.info("✅ Webhook установлен и бот готов")
+    logger.info("✅ Webhook установлен корректно")
 
 if __name__ == "__main__":
     loop.run_until_complete(startup())
