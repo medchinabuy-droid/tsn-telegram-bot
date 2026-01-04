@@ -30,7 +30,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🤖 Бот ЗАПУЩЕН и РАБОТАЕТ\n\nНажмите кнопку 👇",
+        "🤖 Бот ЗАПУЩЕН и работает\n\nНажмите кнопку 👇",
         reply_markup=keyboard,
     )
 
@@ -45,7 +45,7 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_path="/webhook",                 # 🔴 ВАЖНО
+        url_path="webhook",                    # ✅ ПРАВИЛЬНО
         webhook_url=f"{BASE_URL}/webhook",
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
