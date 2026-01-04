@@ -20,19 +20,20 @@ BASE_URL = os.getenv("BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not BOT_TOKEN or not BASE_URL or not WEBHOOK_SECRET:
-    raise RuntimeError("ENV variables missing")
+    raise RuntimeError("❌ ENV variables missing")
 
-logger.info("ENV OK")
+logger.info("✅ ENV OK")
+
+# ================= ASYNC LOOP =================
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 # ================= TELEGRAM =================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# ================= FLASK =================
-app = Flask(__name__)
-
 # ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("✅ /start received from Telegram")
+    logger.info("✅ /start received")
 
     keyboard = ReplyKeyboardMarkup(
         [[KeyboardButton("📤 Отправить чек")]],
@@ -40,23 +41,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🤖 Бот запущен.\n\nНажмите кнопку ниже, чтобы начать.",
-        reply_markup=keyboard
+        "🤖 Бот запущен и работает!\n\nНажмите кнопку ниже 👇",
+        reply_markup=keyboard,
     )
 
 telegram_app.add_handler(CommandHandler("start", start))
 
-# ================= WEBHOOK =================
+# ================= FLASK =================
+app = Flask(__name__)
+
 @app.route("/", methods=["POST"])
 def webhook():
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if secret != WEBHOOK_SECRET:
         abort(403)
 
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    asyncio.get_event_loop().create_task(
-        telegram_app.process_update(update)
+    update = Update.de_json(
+        request.get_json(force=True),
+        telegram_app.bot
     )
+
+    asyncio.run_coroutine_threadsafe(
+        telegram_app.process_update(update),
+        loop
+    )
+
     return "ok"
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -64,15 +73,15 @@ def index():
     return "OK"
 
 # ================= START =================
-async def main():
+async def startup():
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(
         url=BASE_URL,
         secret_token=WEBHOOK_SECRET
     )
     await telegram_app.start()
-    logger.info("✅ Webhook установлен НА /")
+    logger.info("✅ Webhook установлен и бот готов")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(startup())
     app.run(host="0.0.0.0", port=10000)
