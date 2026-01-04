@@ -1,17 +1,12 @@
 import os
 import logging
-
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -27,7 +22,7 @@ logger.info("✅ ENV OK")
 
 # ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("📨 /start received")
+    logger.info("🔥 /start получен")
 
     keyboard = ReplyKeyboardMarkup(
         [[KeyboardButton("📤 Отправить чек")]],
@@ -39,17 +34,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard,
     )
 
-# ================= APP =================
+# ================= MAIN =================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
 
-    logger.info("🚀 Запуск webhook-сервера")
+    logger.info("🚀 Запуск webhook")
 
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
+        webhook_path="/webhook",                 # 🔴 ВАЖНО
         webhook_url=f"{BASE_URL}/webhook",
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
