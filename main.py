@@ -4,11 +4,7 @@ import asyncio
 
 from flask import Flask, request
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== LOGGING ==================
 logging.basicConfig(
@@ -27,8 +23,9 @@ if not BOT_TOKEN or not BASE_URL:
 
 logger.info("✅ ENV OK")
 
-# ================== TELEGRAM APP ==================
+# ================== TELEGRAM ==================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
+loop = asyncio.get_event_loop()
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -40,7 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🤖 Бот запущен и работает.\n\nНажмите кнопку ниже 👇",
+        "🤖 Бот ЗАПУЩЕН и отвечает на /start\n\nНажмите кнопку 👇",
         reply_markup=keyboard,
     )
 
@@ -54,34 +51,32 @@ def index():
     return "OK", 200
 
 @flask_app.route("/webhook", methods=["POST"])
-async def webhook():
-    logger.info("🔥 WEBHOOK POST RECEIVED")
-
+def webhook():
     data = request.get_json(force=True)
+    logger.info("🔥 WEBHOOK RECEIVED")
     logger.info(f"📦 Update: {data}")
 
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    asyncio.run_coroutine_threadsafe(
+        telegram_app.process_update(update),
+        loop,
+    )
 
     return "ok", 200
 
 # ================== STARTUP ==================
-async def on_startup():
+async def startup():
+    await telegram_app.initialize()
+    await telegram_app.start()
+
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+    await telegram_app.bot.set_webhook(f"{BASE_URL}/webhook")
 
-    webhook_url = f"{BASE_URL}/webhook"
-    await telegram_app.bot.set_webhook(webhook_url)
-
-    logger.info(f"✅ Webhook установлен: {webhook_url}")
+    logger.info(f"✅ Webhook установлен: {BASE_URL}/webhook")
 
 # ================== ENTRY ==================
 if __name__ == "__main__":
-    async def main():
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await on_startup()
-
-    asyncio.run(main())
+    loop.run_until_complete(startup())
 
     flask_app.run(
         host="0.0.0.0",
