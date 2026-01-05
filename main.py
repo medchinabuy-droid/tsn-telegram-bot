@@ -1,150 +1,179 @@
 import os
 import logging
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from datetime import datetime
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
 
-# ================= LOGGING =================
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ================= НАСТРОЙКИ =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+
+PORT = int(os.environ.get("PORT", 10000))
+
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ================= ENV =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")  # https://tsn-telegram-bot.onrender.com
-PORT = int(os.getenv("PORT", 10000))
+# ================= GOOGLE =================
 
-if not BOT_TOKEN or not BASE_URL:
-    raise RuntimeError("❌ BOT_TOKEN или BASE_URL не заданы")
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_file(
+    "service_account.json", scopes=SCOPES
+)
+gc = gspread.authorize(creds)
+sheet = gc.open(GOOGLE_SHEET_NAME).sheet2  # ЛИСТ 2
 
-logger.info("✅ ENV OK")
+# ================= СОСТОЯНИЯ =================
 
-# ================= STATES =================
-STATE_NONE = None
-STATE_FIO = "fio"
-STATE_PHONE = "phone"
-STATE_CHECK = "check"
+(
+    FIO,
+    HOUSE,
+    PHONE,
+    CHECK_PHOTO,
+    SUM,
+    DATE,
+) = range(6)
 
-# ================= KEYBOARDS =================
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📤 Отправить чек")],
-            [KeyboardButton("ℹ️ Помощь")],
-        ],
-        resize_keyboard=True,
-    )
+# ================= КЛАВИАТУРЫ =================
+
+start_kb = ReplyKeyboardMarkup(
+    [[KeyboardButton("📎 Отправить чек")]],
+    resize_keyboard=True,
+)
 
 # ================= HANDLERS =================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-
     await update.message.reply_text(
-        "🤖 Бот запущен.\n\n"
-        "Выберите действие:",
-        reply_markup=main_keyboard(),
+        "Бот запущен ✅\n\nНажмите кнопку ниже, чтобы отправить чек.",
+        reply_markup=start_kb,
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ Инструкция:\n"
-        "1️⃣ Нажмите «Отправить чек»\n"
-        "2️⃣ Введите данные\n"
-        "3️⃣ Отправьте фото чека",
-        reply_markup=main_keyboard(),
-    )
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    state = context.user_data.get("state", STATE_NONE)
+async def send_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите ФИО:")
+    return FIO
 
-    # --- КНОПКИ ---
-    if text == "📤 Отправить чек":
-        context.user_data.clear()
-        context.user_data["state"] = STATE_FIO
 
-        await update.message.reply_text(
-            "✍️ Введите ФИО:"
-        )
-        return
+async def get_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["fio"] = update.message.text
+    await update.message.reply_text("Введите номер дома:")
+    return HOUSE
 
-    if text == "ℹ️ Помощь":
-        await help_cmd(update, context)
-        return
 
-    # --- СОСТОЯНИЯ ---
-    if state == STATE_FIO:
-        context.user_data["fio"] = text
-        context.user_data["state"] = STATE_PHONE
+async def get_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["house"] = update.message.text
+    await update.message.reply_text("Введите телефон:")
+    return PHONE
 
-        await update.message.reply_text(
-            "📞 Введите номер телефона:"
-        )
-        return
 
-    if state == STATE_PHONE:
-        context.user_data["phone"] = text
-        context.user_data["state"] = STATE_CHECK
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text
+    await update.message.reply_text("Отправьте фото чека:")
+    return CHECK_PHOTO
 
-        await update.message.reply_text(
-            "📷 Отправьте фото чека:"
-        )
-        return
 
-    # --- ЕСЛИ НЕПОНЯТНО ---
-    await update.message.reply_text(
-        "❗ Пожалуйста, используйте кнопки ниже.",
-        reply_markup=main_keyboard(),
-    )
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != STATE_CHECK:
-        await update.message.reply_text(
-            "❗ Сначала нажмите «Отправить чек».",
-            reply_markup=main_keyboard(),
-        )
-        return
-
+async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
-    file_id = photo.file_id
+    context.user_data["file_unique_id"] = photo.file_unique_id
 
-    fio = context.user_data.get("fio")
-    phone = context.user_data.get("phone")
+    file = await photo.get_file()
+    context.user_data["file_url"] = file.file_path
 
-    logger.info(f"📥 ЧЕК | ФИО={fio} | ТЕЛ={phone} | file_id={file_id}")
+    await update.message.reply_text("Введите сумму по чеку:")
+    return SUM
 
-    context.user_data.clear()
+
+async def get_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["sum"] = update.message.text
+    await update.message.reply_text("Введите дату чека (например 05.01.2026):")
+    return DATE
+
+
+async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    date_text = update.message.text
+
+    file_uid = context.user_data["file_unique_id"]
+    existing = sheet.findall(file_uid)
+    is_duplicate = "TRUE" if existing else "FALSE"
+
+    row = [
+        user.id,
+        user.username or "",
+        context.user_data["fio"],
+        context.user_data["house"],
+        context.user_data["phone"],
+        context.user_data["file_url"],
+        context.user_data["sum"],
+        date_text,
+        "",
+        is_duplicate,
+        file_uid,
+    ]
+
+    sheet.append_row(row)
 
     await update.message.reply_text(
-        "✅ Чек принят!\nСпасибо.",
-        reply_markup=main_keyboard(),
+        "✅ Чек принят и сохранён.\nСпасибо!",
+        reply_markup=start_kb,
     )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Операция отменена")
+    return ConversationHandler.END
 
 # ================= MAIN =================
+
 def main():
+    logger.info("✅ ENV OK")
     app = Application.builder().token(BOT_TOKEN).build()
 
+    conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📎 Отправить чек$"), send_check)],
+        states={
+            FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_fio)],
+            HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_house)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            CHECK_PHOTO: [MessageHandler(filters.PHOTO, get_photo)],
+            SUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sum)],
+            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_date)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(conv)
 
     logger.info("🚀 Запуск webhook")
-
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="webhook",
-        webhook_url=f"{BASE_URL}/webhook",
-        drop_pending_updates=True,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
     )
+
 
 if __name__ == "__main__":
     main()
