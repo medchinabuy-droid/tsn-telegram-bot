@@ -51,27 +51,25 @@ sheet = spreadsheet.worksheet(SHEET_NAME)
 logger.info(f"📄 Подключен лист: {SHEET_NAME}")
 
 # -------------------- СОСТОЯНИЯ --------------------
-(
-    WAIT_FIO,
-    WAIT_HOME,
-    WAIT_PHONE,
-) = range(3)
+WAIT_FIO, WAIT_HOME, WAIT_PHONE = range(3)
 
-# -------------------- START --------------------
+# -------------------- /start --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(
         [[KeyboardButton("🚀 Начать")]],
         resize_keyboard=True,
     )
     await update.message.reply_text(
-        "Здравствуйте! Нажмите «Начать», чтобы заполнить данные.",
+        "Здравствуйте! 👋\n"
+        "Я помогу вам заполнить данные.\n\n"
+        "Нажмите «Начать», чтобы продолжить.",
         reply_markup=keyboard,
     )
 
 # -------------------- НАЧАТЬ --------------------
 async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Введите ФИО:")
+    await update.message.reply_text("✍️ Пожалуйста, введите ФИО:")
     context.user_data["state"] = WAIT_FIO
 
 # -------------------- ОБРАБОТКА ТЕКСТА --------------------
@@ -81,23 +79,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == WAIT_FIO:
         context.user_data["fio"] = text
-        await update.message.reply_text("Введите дом:")
+        await update.message.reply_text("🏠 Укажите дом:")
         context.user_data["state"] = WAIT_HOME
 
     elif state == WAIT_HOME:
         context.user_data["home"] = text
-        await update.message.reply_text("Введите телефон:")
+        await update.message.reply_text(
+            "📞 Укажите номер телефона\n"
+            "Пример: +79261234567"
+        )
         context.user_data["state"] = WAIT_PHONE
 
     elif state == WAIT_PHONE:
         context.user_data["phone"] = text
 
         user = update.effective_user
+        fio = context.user_data["fio"]
 
         row = [
             user.id,                     # telegram_id
             user.username or "",         # username
-            context.user_data["fio"],    # ФИО
+            fio,                          # ФИО
             context.user_data["home"],   # Дом
             context.user_data["phone"],  # Телефон
             "",                           # Ссылка_на_чек
@@ -111,7 +113,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sheet.append_row(row, value_input_option="USER_ENTERED")
 
         await update.message.reply_text(
-            "✅ Данные сохранены.\nСпасибо!",
+            f"✅ {fio}, спасибо!\n"
+            "Ваши данные успешно сохранены.\n\n"
+            "Если нужно — можно начать заново.",
             reply_markup=ReplyKeyboardMarkup(
                 [[KeyboardButton("🚀 Начать")]],
                 resize_keyboard=True,
