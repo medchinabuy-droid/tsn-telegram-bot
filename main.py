@@ -3,11 +3,7 @@ import json
 import logging
 from datetime import datetime
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -45,13 +41,11 @@ creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
-spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-sheet = spreadsheet.worksheet(SHEET_NAME)
-
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 logger.info(f"📄 Подключен лист: {SHEET_NAME}")
 
 # -------------------- СОСТОЯНИЯ --------------------
-WAIT_FIO, WAIT_HOME, WAIT_PHONE = range(3)
+WAIT_FIO, WAIT_HOME, WAIT_PHONE, WAIT_PHOTO = range(4)
 
 # -------------------- /start --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,7 +66,7 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✍️ Пожалуйста, введите ФИО:")
     context.user_data["state"] = WAIT_FIO
 
-# -------------------- ОБРАБОТКА ТЕКСТА --------------------
+# -------------------- ТЕКСТ --------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     text = update.message.text.strip()
@@ -92,37 +86,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state == WAIT_PHONE:
         context.user_data["phone"] = text
-
-        user = update.effective_user
-        fio = context.user_data["fio"]
-
-        row = [
-            user.id,                     # telegram_id
-            user.username or "",         # username
-            fio,                          # ФИО
-            context.user_data["home"],   # Дом
-            context.user_data["phone"],  # Телефон
-            "",                           # Ссылка_на_чек
-            "",                           # Сумма_по_чеку
-            datetime.now().strftime("%Y-%m-%d"),  # Дата_чека
-            "",                           # OCR
-            "",                           # Дубль_чека
-            "",                           # File_Unique_ID
-        ]
-
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-
         await update.message.reply_text(
-            f"✅ {fio}, спасибо!\n"
-            "Ваши данные успешно сохранены.\n\n"
-            "Если нужно — можно начать заново.",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("🚀 Начать")]],
-                resize_keyboard=True,
-            ),
+            "📸 Пожалуйста, отправьте фото чека"
         )
+        context.user_data["state"] = WAIT_PHOTO
 
+# -------------------- ФОТО ЧЕКА --------------------
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != WAIT_PHOTO:
+        return
+
+    photo = update.message.photo[-1]
+    file_unique_id = photo.file_unique_id
+
+    # --- Проверка дубля ---
+    existing_ids = sheet.col_values(11)  # File_Unique_ID = колонка 11
+    if file_unique_id in existing_ids:
+        await update.message.reply_text(
+            "❌ Этот чек уже был загружен ранее.\n"
+            "Если это ошибка — обратитесь к администратору."
+        )
         context.user_data.clear()
+        return
+
+    user = update.effective_user
+    fio = context.user_data["fio"]
+
+    row = [
+        user.id,                     # telegram_id
+        user.username or "",         # username
+        fio,                          # ФИО
+        context.user_data["home"],   # Дом
+        context.user_data["phone"],  # Телефон
+        "",                           # Ссылка_на_чек
+        "",                           # Сумма_по_чеку
+        datetime.now().strftime("%Y-%m-%d"),  # Дата_чека
+        "",                           # OCR
+        "",                           # Дубль_чека
+        file_unique_id,               # File_Unique_ID
+    ]
+
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+
+    await update.message.reply_text(
+        f"✅ {fio}, спасибо!\n"
+        "Чек принят и сохранён.\n\n"
+        "Вы можете начать заново.",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("🚀 Начать")]],
+            resize_keyboard=True,
+        ),
+    )
+
+    context.user_data.clear()
 
 # -------------------- WEBHOOK --------------------
 def main():
@@ -131,6 +147,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🚀 Начать$"), begin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
 
@@ -143,6 +160,5 @@ def main():
         webhook_url=webhook_url,
     )
 
-# --------------------
 if __name__ == "__main__":
     main()
