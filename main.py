@@ -1,11 +1,6 @@
 import os
 import logging
-
-from telegram import (
-    Update,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,61 +27,89 @@ if not BOT_TOKEN or not BASE_URL:
 logger.info("✅ ENV OK")
 
 # ================= STATES =================
-WAIT_FIO = "wait_fio"
-WAIT_PHONE = "wait_phone"
-WAIT_CHECK = "wait_check"
+STATE_NONE = None
+STATE_FIO = "fio"
+STATE_PHONE = "phone"
+STATE_CHECK = "check"
 
-# ================= HANDLERS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("🔥 /start получен")
-
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📤 Отправить чек")]],
+# ================= KEYBOARDS =================
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📤 Отправить чек")],
+            [KeyboardButton("ℹ️ Помощь")],
+        ],
         resize_keyboard=True,
     )
 
+# ================= HANDLERS =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "🤖 Бот запущен и готов к работе.\n\n"
-        "Нажмите кнопку ниже 👇",
-        reply_markup=keyboard,
+        "🤖 Бот запущен.\n\n"
+        "Выберите действие:",
+        reply_markup=main_keyboard(),
     )
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ Инструкция:\n"
+        "1️⃣ Нажмите «Отправить чек»\n"
+        "2️⃣ Введите данные\n"
+        "3️⃣ Отправьте фото чека",
+        reply_markup=main_keyboard(),
+    )
 
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    state = context.user_data.get("state", STATE_NONE)
+
+    # --- КНОПКИ ---
     if text == "📤 Отправить чек":
         context.user_data.clear()
-        context.user_data["state"] = WAIT_FIO
+        context.user_data["state"] = STATE_FIO
 
         await update.message.reply_text(
-            "✍️ Введите ваше ФИО:"
+            "✍️ Введите ФИО:"
         )
+        return
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("state")
+    if text == "ℹ️ Помощь":
+        await help_cmd(update, context)
+        return
 
-    if state == WAIT_FIO:
-        context.user_data["fio"] = update.message.text
-        context.user_data["state"] = WAIT_PHONE
+    # --- СОСТОЯНИЯ ---
+    if state == STATE_FIO:
+        context.user_data["fio"] = text
+        context.user_data["state"] = STATE_PHONE
 
         await update.message.reply_text(
             "📞 Введите номер телефона:"
         )
         return
 
-    if state == WAIT_PHONE:
-        context.user_data["phone"] = update.message.text
-        context.user_data["state"] = WAIT_CHECK
+    if state == STATE_PHONE:
+        context.user_data["phone"] = text
+        context.user_data["state"] = STATE_CHECK
 
         await update.message.reply_text(
             "📷 Отправьте фото чека:"
         )
         return
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("state")
+    # --- ЕСЛИ НЕПОНЯТНО ---
+    await update.message.reply_text(
+        "❗ Пожалуйста, используйте кнопки ниже.",
+        reply_markup=main_keyboard(),
+    )
 
-    if state != WAIT_CHECK:
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_CHECK:
+        await update.message.reply_text(
+            "❗ Сначала нажмите «Отправить чек».",
+            reply_markup=main_keyboard(),
+        )
         return
 
     photo = update.message.photo[-1]
@@ -95,15 +118,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fio = context.user_data.get("fio")
     phone = context.user_data.get("phone")
 
-    logger.info(
-        f"📥 Чек получен | ФИО={fio} | Телефон={phone} | file_id={file_id}"
-    )
+    logger.info(f"📥 ЧЕК | ФИО={fio} | ТЕЛ={phone} | file_id={file_id}")
 
     context.user_data.clear()
 
     await update.message.reply_text(
-        "✅ Чек получен!\n"
-        "Спасибо, данные сохранены."
+        "✅ Чек принят!\nСпасибо.",
+        reply_markup=main_keyboard(),
     )
 
 # ================= MAIN =================
@@ -111,9 +132,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("🚀 Запуск webhook")
 
@@ -122,7 +143,6 @@ def main():
         port=PORT,
         url_path="webhook",
         webhook_url=f"{BASE_URL}/webhook",
-        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
 
