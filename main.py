@@ -15,18 +15,17 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# -------------------- ЛОГИ --------------------
+# ================== ЛОГИ ==================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- ENV --------------------
+# ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-SHEET_NAME = os.getenv("SHEET_NAME", "Лист 2")
 PORT = int(os.getenv("PORT", 10000))
 
 if not all([BOT_TOKEN, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON]):
@@ -34,104 +33,146 @@ if not all([BOT_TOKEN, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON]):
 
 logger.info("✅ ENV OK")
 
-# -------------------- GOOGLE SHEETS --------------------
+# ================== GOOGLE ==================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(GOOGLE_CREDENTIALS_JSON),
+    scopes=SCOPES,
+)
 gc = gspread.authorize(creds)
 
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-logger.info(f"📄 Подключен лист: {SHEET_NAME}")
+sheet_users = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист 1")
+sheet_checks = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист 2")
 
-# -------------------- СОСТОЯНИЯ --------------------
-WAIT_FIO, WAIT_HOME, WAIT_PHONE, WAIT_PHOTO = range(4)
+logger.info("📄 Google Sheets подключены")
 
-# -------------------- /start --------------------
+# ================== STATES ==================
+WAIT_PLOT, WAIT_FIO, WAIT_PHONE, WAIT_PHOTO = range(4)
+
+# ================== HELPERS ==================
+def find_user(telegram_id: int):
+    users = sheet_users.get_all_records()
+    for u in users:
+        if str(u.get("Telegram_ID")) == str(telegram_id):
+            return u
+    return None
+
+# ================== /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("🚀 Начать")]],
-        resize_keyboard=True,
-    )
-    await update.message.reply_text(
-        "Здравствуйте! 👋\n"
-        "Я помогу вам заполнить данные.\n\n"
-        "Нажмите «Начать», чтобы продолжить.",
-        reply_markup=keyboard,
-    )
-
-# -------------------- НАЧАТЬ --------------------
-async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db_user = find_user(user.id)
     context.user_data.clear()
-    await update.message.reply_text("✍️ Пожалуйста, введите ФИО:")
-    context.user_data["state"] = WAIT_FIO
 
-# -------------------- ТЕКСТ --------------------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("state")
-    text = update.message.text.strip()
+    if db_user:
+        context.user_data.update(db_user)
+        await update.message.reply_text(
+            f"👋 Здравствуйте, {db_user.get('ФИО')}!\n"
+            "Мы вас узнали ✅\n\n"
+            "Нажмите «Начать», чтобы загрузить чек.",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("🚀 Начать")]],
+                resize_keyboard=True,
+            ),
+        )
+    else:
+        await update.message.reply_text(
+            "👋 Здравствуйте!\n"
+            "Мы вас пока не нашли в базе.\n"
+            "Давайте заполним данные.\n\n"
+            "Нажмите «Начать».",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("🚀 Начать")]],
+                resize_keyboard=True,
+            ),
+        )
 
-    if state == WAIT_FIO:
-        context.user_data["fio"] = text
-        await update.message.reply_text("🏠 Укажите дом:")
-        context.user_data["state"] = WAIT_HOME
+# ================== BEGIN ==================
+async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
 
-    elif state == WAIT_HOME:
-        context.user_data["home"] = text
+    if not data.get("Участок"):
+        await update.message.reply_text("🏡 Укажите номер участка:")
+        data["state"] = WAIT_PLOT
+        return
+
+    if not data.get("ФИО"):
+        await update.message.reply_text("✍️ Укажите ФИО:")
+        data["state"] = WAIT_FIO
+        return
+
+    if not data.get("Телефон"):
         await update.message.reply_text(
             "📞 Укажите номер телефона\n"
+            "Формат: +7XXXXXXXXXX\n"
             "Пример: +79261234567"
         )
-        context.user_data["state"] = WAIT_PHONE
+        data["state"] = WAIT_PHONE
+        return
+
+    await update.message.reply_text("📸 Отправьте фото чека")
+    data["state"] = WAIT_PHOTO
+
+# ================== TEXT ==================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
+    text = update.message.text.strip()
+    state = data.get("state")
+
+    if state == WAIT_PLOT:
+        data["Участок"] = text
+        await update.message.reply_text("✍️ Укажите ФИО:")
+        data["state"] = WAIT_FIO
+
+    elif state == WAIT_FIO:
+        data["ФИО"] = text
+        await update.message.reply_text(
+            "📞 Укажите номер телефона\n"
+            "Формат: +7XXXXXXXXXX\n"
+            "Пример: +79261234567"
+        )
+        data["state"] = WAIT_PHONE
 
     elif state == WAIT_PHONE:
-        context.user_data["phone"] = text
-        await update.message.reply_text(
-            "📸 Пожалуйста, отправьте фото чека"
-        )
-        context.user_data["state"] = WAIT_PHOTO
+        data["Телефон"] = text
+        await update.message.reply_text("📸 Отправьте фото чека")
+        data["state"] = WAIT_PHOTO
 
-# -------------------- ФОТО ЧЕКА --------------------
+# ================== PHOTO ==================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != WAIT_PHOTO:
+    data = context.user_data
+    if data.get("state") != WAIT_PHOTO:
         return
 
     photo = update.message.photo[-1]
     file_unique_id = photo.file_unique_id
 
-    # --- Проверка дубля ---
-    existing_ids = sheet.col_values(11)  # File_Unique_ID = колонка 11
+    existing_ids = sheet_checks.col_values(11)
     if file_unique_id in existing_ids:
-        await update.message.reply_text(
-            "❌ Этот чек уже был загружен ранее.\n"
-            "Если это ошибка — обратитесь к администратору."
-        )
+        await update.message.reply_text("❌ Этот чек уже был загружен ранее.")
         context.user_data.clear()
         return
 
     user = update.effective_user
-    fio = context.user_data["fio"]
 
     row = [
-        user.id,                     # telegram_id
-        user.username or "",         # username
-        fio,                          # ФИО
-        context.user_data["home"],   # Дом
-        context.user_data["phone"],  # Телефон
-        "",                           # Ссылка_на_чек
-        "",                           # Сумма_по_чеку
-        datetime.now().strftime("%Y-%m-%d"),  # Дата_чека
-        "",                           # OCR
-        "",                           # Дубль_чека
-        file_unique_id,               # File_Unique_ID
+        user.id,
+        user.username or "",
+        data.get("ФИО"),
+        data.get("Участок"),
+        data.get("Телефон"),
+        "",
+        "",
+        datetime.now().strftime("%Y-%m-%d"),
+        "",
+        "Нет",
+        file_unique_id,
     ]
 
-    sheet.append_row(row, value_input_option="USER_ENTERED")
+    sheet_checks.append_row(row, value_input_option="USER_ENTERED")
 
     await update.message.reply_text(
-        f"✅ {fio}, спасибо!\n"
-        "Чек принят и сохранён.\n\n"
-        "Вы можете начать заново.",
+        f"✅ {data.get('ФИО')}, данные сохранены.\n"
+        "Спасибо!",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("🚀 Начать")]],
             resize_keyboard=True,
@@ -140,7 +181,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
 
-# -------------------- WEBHOOK --------------------
+# ================== WEBHOOK ==================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -151,12 +192,11 @@ def main():
 
     webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
 
-    logger.info("🚀 Запуск webhook")
+    logger.info("🚀 Webhook запущен")
 
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="",
         webhook_url=webhook_url,
     )
 
