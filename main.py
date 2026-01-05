@@ -14,6 +14,9 @@ from telegram.ext import (
 
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from io import BytesIO
 
 # ================== LOGGING ==================
 logging.basicConfig(
@@ -26,42 +29,64 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 PORT = int(os.getenv("PORT", 10000))
 
-if not all([BOT_TOKEN, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON]):
+if not all([BOT_TOKEN, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON, DRIVE_FOLDER_ID]):
     raise RuntimeError("❌ Не все ENV переменные заданы")
 
 logger.info("✅ ENV OK")
 
-# ================== GOOGLE ==================
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# ================== GOOGLE AUTH ==================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 creds = Credentials.from_service_account_info(
     json.loads(GOOGLE_CREDENTIALS_JSON),
     scopes=SCOPES,
 )
+
 gc = gspread.authorize(creds)
+drive = build("drive", "v3", credentials=creds)
 
 sheet_users = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист 1")
 sheet_checks = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист 2")
 
 logger.info("📄 Google Sheets подключены")
+logger.info("📁 Google Drive подключен")
 
 # ================== STATES ==================
-WAIT_PLOT, WAIT_FIO, WAIT_PHONE, WAIT_PHOTO = range(4)
+WAIT_PLOT, WAIT_FIO, WAIT_PHONE, WAIT_FILE = range(4)
 
 # ================== HELPERS ==================
 def find_user(telegram_id: int):
-    users = sheet_users.get_all_records()
-    for u in users:
-        if str(u.get("Telegram_ID")) == str(telegram_id):
-            return u
+    for row in sheet_users.get_all_records():
+        if str(row.get("Telegram_ID")) == str(telegram_id):
+            return row
     return None
+
+def upload_to_drive(file_bytes: bytes, filename: str, mime_type: str) -> str:
+    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime_type)
+    file_metadata = {
+        "name": filename,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+
+    file = drive.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+    ).execute()
+
+    return file["webViewLink"]
 
 # ================== /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     user = update.effective_user
     db_user = find_user(user.id)
-    context.user_data.clear()
 
     if db_user:
         context.user_data.update(db_user)
@@ -77,7 +102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "👋 Здравствуйте!\n"
-            "Мы вас пока не нашли в базе.\n"
+            "Мы вас не нашли в базе.\n"
             "Давайте заполним данные.\n\n"
             "Нажмите «🚀 Начать».",
             reply_markup=ReplyKeyboardMarkup(
@@ -91,86 +116,97 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
 
     if not data.get("Участок"):
-        await update.message.reply_text("🏡 Укажите номер участка:")
         data["state"] = WAIT_PLOT
+        await update.message.reply_text("🏡 Укажите номер участка:")
         return
 
     if not data.get("ФИО"):
-        await update.message.reply_text("✍️ Укажите ФИО:")
         data["state"] = WAIT_FIO
+        await update.message.reply_text("✍️ Укажите ФИО:")
         return
 
     if not data.get("Телефон"):
+        data["state"] = WAIT_PHONE
         await update.message.reply_text(
-            "📞 Укажите номер телефона\n"
+            "📞 Укажите телефон\n"
             "Формат: +7XXXXXXXXXX\n"
             "Пример: +79261234567"
         )
-        data["state"] = WAIT_PHONE
         return
 
+    data["state"] = WAIT_FILE
     await update.message.reply_text(
-        "📸 Отправьте фото чека",
+        "📎 Отправьте фото или PDF чека",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("❌ Отмена")]],
             resize_keyboard=True,
         ),
     )
-    data["state"] = WAIT_PHOTO
 
 # ================== TEXT ==================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     data = context.user_data
-    state = data.get("state")
 
     if text == "❌ Отмена":
         await start(update, context)
         return
 
+    state = data.get("state")
+
     if state == WAIT_PLOT:
         data["Участок"] = text
-        await update.message.reply_text("✍️ Укажите ФИО:")
         data["state"] = WAIT_FIO
+        await update.message.reply_text("✍️ Укажите ФИО:")
 
     elif state == WAIT_FIO:
         data["ФИО"] = text
+        data["state"] = WAIT_PHONE
         await update.message.reply_text(
-            "📞 Укажите номер телефона\n"
+            "📞 Укажите телефон\n"
             "Формат: +7XXXXXXXXXX\n"
             "Пример: +79261234567"
         )
-        data["state"] = WAIT_PHONE
 
     elif state == WAIT_PHONE:
         data["Телефон"] = text
-        await update.message.reply_text("📸 Отправьте фото чека")
-        data["state"] = WAIT_PHOTO
+        data["state"] = WAIT_FILE
+        await update.message.reply_text("📎 Отправьте фото или PDF чека")
 
-# ================== PHOTO ==================
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== FILE ==================
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
-    if data.get("state") != WAIT_PHOTO:
+    if data.get("state") != WAIT_FILE:
         return
 
-    photo = update.message.photo[-1]
-    file_unique_id = photo.file_unique_id
+    user = update.effective_user
 
+    if update.message.photo:
+        file = update.message.photo[-1]
+        mime = "image/jpeg"
+        ext = "jpg"
+    elif update.message.document:
+        file = update.message.document
+        mime = file.mime_type
+        ext = "pdf"
+    else:
+        return
+
+    file_unique_id = file.file_unique_id
     existing_ids = sheet_checks.col_values(11)
 
     if file_unique_id in existing_ids:
         await update.message.reply_text(
             "❌ Этот чек уже был загружен ранее.\n\n"
-            "📸 Чтобы загрузить **другой чек**, просто отправьте новое фото.",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("🚀 Начать")]],
-                resize_keyboard=True,
-            ),
+            "📎 Отправьте **другой чек** или новый файл."
         )
-        data["state"] = WAIT_PHOTO
         return
 
-    user = update.effective_user
+    tg_file = await file.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+
+    filename = f"check_{user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+    drive_link = upload_to_drive(file_bytes, filename, mime)
 
     row = [
         user.id,
@@ -178,7 +214,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data.get("ФИО"),
         data.get("Участок"),
         data.get("Телефон"),
-        "",
+        drive_link,
         "",
         datetime.now().strftime("%Y-%m-%d"),
         "",
@@ -189,7 +225,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_checks.append_row(row, value_input_option="USER_ENTERED")
 
     await update.message.reply_text(
-        f"✅ {data.get('ФИО')}, данные сохранены.\nСпасибо!",
+        f"✅ {data.get('ФИО')}, чек успешно сохранён!\n"
+        "Спасибо 🙌",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("🚀 Начать")]],
             resize_keyboard=True,
@@ -198,14 +235,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
 
-# ================== WEBHOOK ==================
+# ================== MAIN ==================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🚀 Начать$"), begin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
 
     webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
 
