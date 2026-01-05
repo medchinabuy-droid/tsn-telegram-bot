@@ -15,7 +15,7 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================== ЛОГИ ==================
+# ================== LOGGING ==================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -68,7 +68,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 Здравствуйте, {db_user.get('ФИО')}!\n"
             "Мы вас узнали ✅\n\n"
-            "Нажмите «Начать», чтобы загрузить чек.",
+            "Нажмите «🚀 Начать», чтобы загрузить чек.",
             reply_markup=ReplyKeyboardMarkup(
                 [[KeyboardButton("🚀 Начать")]],
                 resize_keyboard=True,
@@ -79,7 +79,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 Здравствуйте!\n"
             "Мы вас пока не нашли в базе.\n"
             "Давайте заполним данные.\n\n"
-            "Нажмите «Начать».",
+            "Нажмите «🚀 Начать».",
             reply_markup=ReplyKeyboardMarkup(
                 [[KeyboardButton("🚀 Начать")]],
                 resize_keyboard=True,
@@ -109,14 +109,24 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["state"] = WAIT_PHONE
         return
 
-    await update.message.reply_text("📸 Отправьте фото чека")
+    await update.message.reply_text(
+        "📸 Отправьте фото чека",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("❌ Отмена")]],
+            resize_keyboard=True,
+        ),
+    )
     data["state"] = WAIT_PHOTO
 
 # ================== TEXT ==================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data
     text = update.message.text.strip()
+    data = context.user_data
     state = data.get("state")
+
+    if text == "❌ Отмена":
+        await start(update, context)
+        return
 
     if state == WAIT_PLOT:
         data["Участок"] = text
@@ -147,9 +157,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_unique_id = photo.file_unique_id
 
     existing_ids = sheet_checks.col_values(11)
+
     if file_unique_id in existing_ids:
-        await update.message.reply_text("❌ Этот чек уже был загружен ранее.")
-        context.user_data.clear()
+        await update.message.reply_text(
+            "❌ Этот чек уже был загружен ранее.\n\n"
+            "📸 Чтобы загрузить **другой чек**, просто отправьте новое фото.",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("🚀 Начать")]],
+                resize_keyboard=True,
+            ),
+        )
+        data["state"] = WAIT_PHOTO
         return
 
     user = update.effective_user
@@ -171,8 +189,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_checks.append_row(row, value_input_option="USER_ENTERED")
 
     await update.message.reply_text(
-        f"✅ {data.get('ФИО')}, данные сохранены.\n"
-        "Спасибо!",
+        f"✅ {data.get('ФИО')}, данные сохранены.\nСпасибо!",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("🚀 Начать")]],
             resize_keyboard=True,
