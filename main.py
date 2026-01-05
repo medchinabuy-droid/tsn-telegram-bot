@@ -47,7 +47,7 @@ credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 # Sheets
 gc = gspread.authorize(credentials)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-sheet2 = spreadsheet.worksheet("Лист2")
+sheet2 = spreadsheet.worksheet("Лист 2")
 logger.info("📄 Google Sheets подключены")
 
 # Drive
