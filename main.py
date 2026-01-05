@@ -5,8 +5,8 @@ from datetime import datetime
 
 from telegram import (
     Update,
-    KeyboardButton,
     ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -19,98 +19,126 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================= ЛОГИ =================
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ================= ENV =================
+# -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+SHEET_NAME = os.getenv("SHEET_NAME", "Лист 2")
+PORT = int(os.getenv("PORT", 10000))
 
-# Render автоматически
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
-
-if not BOT_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
-    raise RuntimeError("❌ Не все ENV переменные заданы (BOT_TOKEN / SPREADSHEET_ID / GOOGLE_CREDENTIALS_JSON)")
+if not all([BOT_TOKEN, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON]):
+    raise RuntimeError("❌ Не все ENV переменные заданы")
 
 logger.info("✅ ENV OK")
 
-# ================= GOOGLE SHEETS =================
+# -------------------- GOOGLE SHEETS --------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-
 gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист2")
 
-# ================= HANDLERS =================
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+sheet = spreadsheet.worksheet(SHEET_NAME)
+
+logger.info(f"📄 Подключен лист: {SHEET_NAME}")
+
+# -------------------- СОСТОЯНИЯ --------------------
+(
+    WAIT_FIO,
+    WAIT_HOME,
+    WAIT_PHONE,
+) = range(3)
+
+# -------------------- START --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📤 Отправить чек")]],
+        [[KeyboardButton("🚀 Начать")]],
         resize_keyboard=True,
     )
-
     await update.message.reply_text(
-        "👋 Добро пожаловать!\n\nНажмите кнопку ниже, чтобы отправить чек.",
+        "Здравствуйте! Нажмите «Начать», чтобы заполнить данные.",
         reply_markup=keyboard,
     )
 
-async def handle_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✍️ Введите ваше ФИО:")
-    context.user_data["step"] = "fio"
+# -------------------- НАЧАТЬ --------------------
+async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Введите ФИО:")
+    context.user_data["state"] = WAIT_FIO
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
+# -------------------- ОБРАБОТКА ТЕКСТА --------------------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state")
+    text = update.message.text.strip()
 
-    if step == "fio":
-        context.user_data["fio"] = update.message.text
-        await update.message.reply_text("🏠 Введите номер дома:")
-        context.user_data["step"] = "house"
+    if state == WAIT_FIO:
+        context.user_data["fio"] = text
+        await update.message.reply_text("Введите дом:")
+        context.user_data["state"] = WAIT_HOME
 
-    elif step == "house":
-        context.user_data["house"] = update.message.text
-        await update.message.reply_text("📞 Введите телефон:")
-        context.user_data["step"] = "phone"
+    elif state == WAIT_HOME:
+        context.user_data["home"] = text
+        await update.message.reply_text("Введите телефон:")
+        context.user_data["state"] = WAIT_PHONE
 
-    elif step == "phone":
-        context.user_data["phone"] = update.message.text
+    elif state == WAIT_PHONE:
+        context.user_data["phone"] = text
 
-        sheet.append_row([
-            update.effective_user.id,
-            update.effective_user.username,
-            context.user_data["fio"],
-            context.user_data["house"],
-            context.user_data["phone"],
-            "", "", datetime.now().strftime("%Y-%m-%d"), "", "", ""
-        ])
+        user = update.effective_user
 
-        await update.message.reply_text("✅ Данные сохранены. Спасибо!")
+        row = [
+            user.id,                     # telegram_id
+            user.username or "",         # username
+            context.user_data["fio"],    # ФИО
+            context.user_data["home"],   # Дом
+            context.user_data["phone"],  # Телефон
+            "",                           # Ссылка_на_чек
+            "",                           # Сумма_по_чеку
+            datetime.now().strftime("%Y-%m-%d"),  # Дата_чека
+            "",                           # OCR
+            "",                           # Дубль_чека
+            "",                           # File_Unique_ID
+        ]
+
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+
+        await update.message.reply_text(
+            "✅ Данные сохранены.\nСпасибо!",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("🚀 Начать")]],
+                resize_keyboard=True,
+            ),
+        )
+
         context.user_data.clear()
 
-# ================= APP =================
-def build_app() -> Application:
+# -------------------- WEBHOOK --------------------
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^📤 Отправить чек$"), handle_check_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.Regex("^🚀 Начать$"), begin))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    return app
-
-# ================= ENTRY =================
-if __name__ == "__main__":
-    app = build_app()
+    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
 
     logger.info("🚀 Запуск webhook")
 
     app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
+        port=PORT,
         url_path="",
-        webhook_url=WEBHOOK_URL,
+        webhook_url=webhook_url,
     )
+
+# --------------------
+if __name__ == "__main__":
+    main()
