@@ -5,14 +5,13 @@ from datetime import datetime
 
 from telegram import (
     Update,
-    ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -29,131 +28,89 @@ logger = logging.getLogger(__name__)
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://tsn-telegram-bot.onrender.com
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON]):
-    raise RuntimeError("❌ Не все ENV переменные заданы")
+# Render автоматически
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+if not BOT_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+    raise RuntimeError("❌ Не все ENV переменные заданы (BOT_TOKEN / SPREADSHEET_ID / GOOGLE_CREDENTIALS_JSON)")
 
 logger.info("✅ ENV OK")
 
 # ================= GOOGLE SHEETS =================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-service_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
+creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+
 gc = gspread.authorize(creds)
-
-sheet = gc.open_by_key(SPREADSHEET_ID).get_worksheet(1)  # ЛИСТ 2
-
-# ================= STATES =================
-(
-    WAIT_FIO,
-    WAIT_HOME,
-    WAIT_PHONE,
-    WAIT_RECEIPT,
-) = range(4)
-
-# ================= КНОПКИ =================
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("📤 Отправить чек")]],
-    resize_keyboard=True,
-)
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист2")
 
 # ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Бот запущен.\n\nНажмите кнопку ниже, чтобы отправить чек.",
-        reply_markup=MAIN_KEYBOARD,
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📤 Отправить чек")]],
+        resize_keyboard=True,
     )
 
-async def start_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Введите ФИО:")
-    return WAIT_FIO
-
-async def get_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["fio"] = update.message.text.strip()
-    await update.message.reply_text("Введите номер дома:")
-    return WAIT_HOME
-
-async def get_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["home"] = update.message.text.strip()
-    await update.message.reply_text("Введите телефон:")
-    return WAIT_PHONE
-
-async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("Отправьте фото чека 📸")
-    return WAIT_RECEIPT
-
-async def get_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-
-    file_id = photo.file_id
-    file_unique_id = photo.file_unique_id
-
-    user = update.effective_user
-
-    row = [
-        user.id,                          # telegram_id
-        user.username or "",              # username
-        context.user_data.get("fio", ""), # ФИО
-        context.user_data.get("home", ""),# Дом
-        context.user_data.get("phone", ""),# Телефон
-        file_id,                          # Ссылка_на_чек
-        "",                               # Сумма_по_чеку
-        datetime.now().strftime("%d.%m.%Y %H:%M"),
-        "",                               # OCR
-        "",                               # Дубль_чека
-        file_unique_id,                   # File_Unique_ID
-    ]
-
-    sheet.append_row(row, value_input_option="USER_ENTERED")
-
     await update.message.reply_text(
-        "✅ Чек принят и сохранён.\nСпасибо!",
-        reply_markup=MAIN_KEYBOARD,
+        "👋 Добро пожаловать!\n\nНажмите кнопку ниже, чтобы отправить чек.",
+        reply_markup=keyboard,
     )
-    return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "❌ Отменено",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    return ConversationHandler.END
+async def handle_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✍️ Введите ваше ФИО:")
+    context.user_data["step"] = "fio"
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get("step")
+
+    if step == "fio":
+        context.user_data["fio"] = update.message.text
+        await update.message.reply_text("🏠 Введите номер дома:")
+        context.user_data["step"] = "house"
+
+    elif step == "house":
+        context.user_data["house"] = update.message.text
+        await update.message.reply_text("📞 Введите телефон:")
+        context.user_data["step"] = "phone"
+
+    elif step == "phone":
+        context.user_data["phone"] = update.message.text
+
+        sheet.append_row([
+            update.effective_user.id,
+            update.effective_user.username,
+            context.user_data["fio"],
+            context.user_data["house"],
+            context.user_data["phone"],
+            "", "", datetime.now().strftime("%Y-%m-%d"), "", "", ""
+        ])
+
+        await update.message.reply_text("✅ Данные сохранены. Спасибо!")
+        context.user_data.clear()
 
 # ================= APP =================
-def main():
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.TEXT & filters.Regex("^📤 Отправить чек$"), start_receipt)
-        ],
-        states={
-            WAIT_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_fio)],
-            WAIT_HOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_home)],
-            WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-            WAIT_RECEIPT: [MessageHandler(filters.PHOTO, get_receipt)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.Regex("^📤 Отправить чек$"), handle_check_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    return app
+
+# ================= ENTRY =================
+if __name__ == "__main__":
+    app = build_app()
 
     logger.info("🚀 Запуск webhook")
 
     app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
+        port=int(os.getenv("PORT", 10000)),
+        url_path="",
         webhook_url=WEBHOOK_URL,
-        drop_pending_updates=True,
     )
-
-# ================= ENTRY =================
-if __name__ == "__main__":
-    main()
