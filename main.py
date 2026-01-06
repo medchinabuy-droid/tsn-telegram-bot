@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import logging
 from datetime import datetime
@@ -8,6 +9,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -16,7 +18,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-import io
 
 # ================== ЛОГИ ==================
 logging.basicConfig(level=logging.INFO)
@@ -24,125 +25,121 @@ logger = logging.getLogger(__name__)
 
 # ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # ВАЖНО: ID, не имя
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # может быть пустым
-PORT = int(os.getenv("PORT", 10000))
+GOOGLE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "TSN")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not BOT_TOKEN or not GOOGLE_CREDENTIALS_JSON or not SPREADSHEET_ID:
-    raise RuntimeError("❌ BOT_TOKEN / GOOGLE_CREDENTIALS_JSON / SPREADSHEET_ID обязательны")
+if not all([BOT_TOKEN, GOOGLE_JSON, SPREADSHEET_NAME, GOOGLE_DRIVE_FOLDER_ID, WEBHOOK_URL]):
+    raise RuntimeError("❌ Не все ENV заданы")
 
 logger.info("✅ ENV OK")
 
 # ================== GOOGLE AUTH ==================
-creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-
-SCOPES = [
+creds_dict = json.loads(GOOGLE_JSON)
+scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
-credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 gc = gspread.authorize(credentials)
-spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+spreadsheet = gc.open(SPREADSHEET_NAME)
 
-sheet_users = spreadsheet.worksheet("Лист1")
+# ВАЖНО: ИМЕНА С ПРОБЕЛАМИ
+sheet_users = spreadsheet.worksheet("Лист 1")
 sheet_checks = spreadsheet.worksheet("Лист 2")
 
-logger.info("📄 Google Sheets подключены")
-
 drive_service = build("drive", "v3", credentials=credentials)
-logger.info("📁 Google Drive подключен")
 
-# ================== DRIVE ==================
-DRIVE_FOLDER_NAME = "TSN_CHECKS"
-
-def get_or_create_folder(name: str) -> str:
-    q = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    res = drive_service.files().list(q=q, fields="files(id)").execute()
-    if res["files"]:
-        return res["files"][0]["id"]
-
-    folder = drive_service.files().create(
-        body={"name": name, "mimeType": "application/vnd.google-apps.folder"},
-        fields="id"
-    ).execute()
-    return folder["id"]
-
-FOLDER_ID = get_or_create_folder(DRIVE_FOLDER_NAME)
+# ================== STATES ==================
+ASK_FIO, ASK_HOUSE, ASK_PHONE, WAIT_CHECK = range(4)
 
 # ================== HELPERS ==================
-def find_user_row(telegram_id: int):
-    rows = sheet_users.get_all_records()
-    for i, row in enumerate(rows, start=2):
-        if str(row.get("Telegram_ID")) == str(telegram_id):
-            return i, row
-    return None, None
+def find_user_by_telegram_id(tg_id: str):
+    records = sheet_users.get_all_records()
+    for r in records:
+        if str(r.get("Telegram_ID")).strip() == tg_id:
+            return r
+    return None
 
-def check_duplicate(file_unique_id: str) -> bool:
-    values = sheet_checks.col_values(1)
-    return file_unique_id in values
 
-def save_check(file_unique_id, user_id, fio, phone, file_url):
-    sheet_checks.append_row([
-        file_unique_id,
-        user_id,
-        fio,
-        phone,
-        file_url,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    ])
+def is_duplicate(file_unique_id: str) -> bool:
+    ids = sheet_checks.col_values(11)  # File_Unique_ID
+    return file_unique_id in ids
 
-# ================== BOT HANDLERS ==================
+
+# ================== START ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    row_num, user = find_user_row(tg_id)
+    user = update.effective_user
+    tg_id = str(user.id)
 
-    if user:
-        fio = user.get("ФИО", "")
-        phone = user.get("Телефон", "")
-        text = f"👋 Привет, {fio}!\n"
-        if not phone:
-            text += "📞 Укажи телефон в формате +7926..."
-        else:
-            text += "📸 Пришли фото или PDF чека"
-    else:
-        text = (
-            "👋 Привет!\n"
-            "Я не нашёл тебя в базе.\n\n"
-            "📞 Укажи телефон в формате +7926..."
+    record = find_user_by_telegram_id(tg_id)
+
+    if record:
+        context.user_data["fio"] = record.get("ФИО", "")
+        context.user_data["house"] = record.get("Участок", "")
+        context.user_data["phone"] = record.get("Телефон", "")
+
+        await update.message.reply_text(
+            f"👋 Привет, {context.user_data['fio']}!\n\n"
+            f"Мы вас узнали.\n"
+            f"🏠 Участок: {context.user_data['house']}\n"
+            f"📞 Телефон: {context.user_data['phone']}\n\n"
+            f"📸 Пожалуйста, отправьте фото или PDF чека."
         )
+        return WAIT_CHECK
 
-    await update.message.reply_text(text)
+    await update.message.reply_text("Здравствуйте!\nВведите ваше ФИО:")
+    return ASK_FIO
 
-async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    if not phone.startswith("+7"):
-        await update.message.reply_text("❌ Формат неверный. Пример: +79261234567")
-        return
 
-    context.user_data["phone"] = phone
-    await update.message.reply_text("📸 Теперь пришли фото или PDF чека")
+# ================== REGISTRATION ==================
+async def ask_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["fio"] = update.message.text.strip()
+    await update.message.reply_text("Введите номер участка:")
+    return ASK_HOUSE
 
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def ask_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["house"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Введите телефон в формате:\n"
+        "+7926XXXXXXX\n\n"
+        "❗ Обязательно с +7"
+    )
+    return ASK_PHONE
+
+
+async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+
+    await update.message.reply_text(
+        f"✅ Данные сохранены.\n"
+        f"Спасибо, {context.user_data['fio']}!\n\n"
+        f"📸 Теперь отправьте фото или PDF чека."
+    )
+    return WAIT_CHECK
+
+
+# ================== CHECK HANDLER ==================
+async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    tg_id = update.effective_user.id
 
     if message.photo:
         file = message.photo[-1]
     elif message.document:
         file = message.document
     else:
-        return
+        await message.reply_text("❌ Отправьте фото или PDF файл.")
+        return WAIT_CHECK
 
+    file_id = file.file_id
     file_unique_id = file.file_unique_id
 
-    if check_duplicate(file_unique_id):
-        await message.reply_text("⚠️ Этот чек уже был загружен")
-        return
+    duplicate = is_duplicate(file_unique_id)
 
-    tg_file = await context.bot.get_file(file.file_id)
+    tg_file = await context.bot.get_file(file_id)
     file_bytes = await tg_file.download_as_bytearray()
 
     media = MediaIoBaseUpload(
@@ -151,50 +148,70 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resumable=False,
     )
 
-    drive_file = drive_service.files().create(
-        media_body=media,
+    uploaded = drive_service.files().create(
         body={
-            "name": f"{file_unique_id}",
-            "parents": [FOLDER_ID],
+            "name": f"check_{update.effective_user.id}_{file_unique_id}",
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
         },
+        media_body=media,
         fields="id, webViewLink",
     ).execute()
 
-    row_num, user = find_user_row(tg_id)
-    fio = user.get("ФИО", "") if user else ""
-    phone = user.get("Телефон", "") if user else context.user_data.get("phone", "")
+    drive_link = uploaded["webViewLink"]
 
-    save_check(
+    sheet_checks.append_row([
+        str(update.effective_user.id),
+        update.effective_user.username,
+        context.user_data.get("fio", ""),
+        context.user_data.get("house", ""),
+        context.user_data.get("phone", ""),
+        drive_link,
+        "",
+        datetime.now().strftime("%Y-%m-%d"),
+        "",
+        "ДА" if duplicate else "НЕТ",
         file_unique_id,
-        tg_id,
-        fio,
-        phone,
-        drive_file["webViewLink"],
-    )
+    ])
 
-    await message.reply_text(
-        f"✅ Данные сохранены.\nСпасибо!\n\n🔗 {drive_file['webViewLink']}"
-    )
-
-# ================== APP ==================
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
-
-    if WEBHOOK_URL:
-        logger.info("🚀 WEBHOOK MODE")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
+    if duplicate:
+        await message.reply_text(
+            "⚠️ Этот чек уже был загружен ранее.\n"
+            "Пожалуйста, отправьте другой чек."
         )
     else:
-        logger.warning("⚠️ POLLING MODE — webhook удаляется")
-        app.bot.delete_webhook(drop_pending_updates=True)
-        app.run_polling()
+        await message.reply_text(
+            "✅ Чек успешно принят и сохранён.\n"
+            "Спасибо!"
+        )
+
+    return WAIT_CHECK
+
+
+# ================== MAIN ==================
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASK_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_fio)],
+            ASK_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_house)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            WAIT_CHECK: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, handle_check)
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
+    application.add_handler(conv)
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=WEBHOOK_URL,
+    )
+
 
 if __name__ == "__main__":
     main()
