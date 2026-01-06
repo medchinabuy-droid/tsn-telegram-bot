@@ -19,82 +19,102 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================== ЛОГИ ==================
+# ================= ЛОГИ =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================== ENV ==================
+# ================= ENV (БЕЗ ПАДЕНИЯ) =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "TSN")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 10000))
 
-if not all([BOT_TOKEN, GOOGLE_JSON, SPREADSHEET_NAME, GOOGLE_DRIVE_FOLDER_ID, WEBHOOK_URL]):
-    raise RuntimeError("❌ Не все ENV заданы")
+missing_env = []
+if not BOT_TOKEN: missing_env.append("BOT_TOKEN")
+if not GOOGLE_JSON: missing_env.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not GOOGLE_DRIVE_FOLDER_ID: missing_env.append("GOOGLE_DRIVE_FOLDER_ID")
+if not WEBHOOK_URL: missing_env.append("WEBHOOK_URL")
 
-logger.info("✅ ENV OK")
+if missing_env:
+    logger.error(f"❌ Отсутствуют ENV: {', '.join(missing_env)}")
+else:
+    logger.info("✅ Все ENV присутствуют")
 
-# ================== GOOGLE AUTH ==================
-creds_dict = json.loads(GOOGLE_JSON)
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+# ================= GOOGLE INIT =================
+sheet_users = None
+sheet_checks = None
+drive_service = None
 
-gc = gspread.authorize(credentials)
-spreadsheet = gc.open(SPREADSHEET_NAME)
+if GOOGLE_JSON:
+    try:
+        creds_dict = json.loads(GOOGLE_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
-# ВАЖНО: ИМЕНА С ПРОБЕЛАМИ
-sheet_users = spreadsheet.worksheet("Лист 1")
-sheet_checks = spreadsheet.worksheet("Лист 2")
+        gc = gspread.authorize(credentials)
+        spreadsheet = gc.open(SPREADSHEET_NAME)
 
-drive_service = build("drive", "v3", credentials=credentials)
+        sheet_users = spreadsheet.worksheet("Лист 1")
+        sheet_checks = spreadsheet.worksheet("Лист 2")
 
-# ================== STATES ==================
+        drive_service = build("drive", "v3", credentials=credentials)
+
+        logger.info("✅ Google Sheets и Drive подключены")
+
+    except Exception as e:
+        logger.exception("❌ Ошибка Google API")
+
+# ================= STATES =================
 ASK_FIO, ASK_HOUSE, ASK_PHONE, WAIT_CHECK = range(4)
 
-# ================== HELPERS ==================
-def find_user_by_telegram_id(tg_id: str):
-    records = sheet_users.get_all_records()
-    for r in records:
-        if str(r.get("Telegram_ID")).strip() == tg_id:
-            return r
+# ================= HELPERS =================
+def find_user(tg_id: str):
+    if not sheet_users:
+        return None
+    for row in sheet_users.get_all_records():
+        if str(row.get("Telegram_ID", "")).strip() == tg_id:
+            return row
     return None
 
 
-def is_duplicate(file_unique_id: str) -> bool:
-    ids = sheet_checks.col_values(11)  # File_Unique_ID
-    return file_unique_id in ids
+def is_duplicate(unique_id: str) -> bool:
+    if not sheet_checks:
+        return False
+    ids = sheet_checks.col_values(11)
+    return unique_id in ids
 
 
-# ================== START ==================
+# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    tg_id = str(user.id)
+    if not sheet_users:
+        await update.message.reply_text("⚠️ Сервис временно недоступен.")
+        return ConversationHandler.END
 
-    record = find_user_by_telegram_id(tg_id)
+    tg_id = str(update.effective_user.id)
+    user = find_user(tg_id)
 
-    if record:
-        context.user_data["fio"] = record.get("ФИО", "")
-        context.user_data["house"] = record.get("Участок", "")
-        context.user_data["phone"] = record.get("Телефон", "")
+    if user:
+        context.user_data.update({
+            "fio": user.get("ФИО", ""),
+            "house": user.get("Участок", ""),
+            "phone": user.get("Телефон", ""),
+        })
 
         await update.message.reply_text(
             f"👋 Привет, {context.user_data['fio']}!\n\n"
-            f"Мы вас узнали.\n"
-            f"🏠 Участок: {context.user_data['house']}\n"
-            f"📞 Телефон: {context.user_data['phone']}\n\n"
-            f"📸 Пожалуйста, отправьте фото или PDF чека."
+            f"📸 Отправьте фото или PDF чека."
         )
         return WAIT_CHECK
 
-    await update.message.reply_text("Здравствуйте!\nВведите ваше ФИО:")
+    await update.message.reply_text("Введите ФИО:")
     return ASK_FIO
 
 
-# ================== REGISTRATION ==================
 async def ask_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fio"] = update.message.text.strip()
     await update.message.reply_text("Введите номер участка:")
@@ -105,91 +125,76 @@ async def ask_house(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["house"] = update.message.text.strip()
     await update.message.reply_text(
         "Введите телефон в формате:\n"
-        "+7926XXXXXXX\n\n"
-        "❗ Обязательно с +7"
+        "+7926XXXXXXX"
     )
     return ASK_PHONE
 
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = update.message.text.strip()
-
-    await update.message.reply_text(
-        f"✅ Данные сохранены.\n"
-        f"Спасибо, {context.user_data['fio']}!\n\n"
-        f"📸 Теперь отправьте фото или PDF чека."
-    )
+    await update.message.reply_text("📸 Теперь отправьте чек.")
     return WAIT_CHECK
 
 
-# ================== CHECK HANDLER ==================
+# ================= CHECK =================
 async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-
-    if message.photo:
-        file = message.photo[-1]
-    elif message.document:
-        file = message.document
-    else:
-        await message.reply_text("❌ Отправьте фото или PDF файл.")
+    if not drive_service or not sheet_checks:
+        await update.message.reply_text("⚠️ Сервис временно недоступен.")
         return WAIT_CHECK
 
-    file_id = file.file_id
-    file_unique_id = file.file_unique_id
+    msg = update.message
 
-    duplicate = is_duplicate(file_unique_id)
+    if msg.photo:
+        file = msg.photo[-1]
+    elif msg.document:
+        file = msg.document
+    else:
+        await msg.reply_text("Отправьте фото или PDF.")
+        return WAIT_CHECK
 
-    tg_file = await context.bot.get_file(file_id)
-    file_bytes = await tg_file.download_as_bytearray()
+    if is_duplicate(file.file_unique_id):
+        await msg.reply_text("⚠️ Этот чек уже был загружен.")
+        return WAIT_CHECK
 
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_bytes),
-        mimetype="application/octet-stream",
-        resumable=False,
-    )
+    tg_file = await context.bot.get_file(file.file_id)
+    data = await tg_file.download_as_bytearray()
+
+    media = MediaIoBaseUpload(io.BytesIO(data), resumable=False)
 
     uploaded = drive_service.files().create(
         body={
-            "name": f"check_{update.effective_user.id}_{file_unique_id}",
+            "name": f"check_{update.effective_user.id}_{file.file_unique_id}",
             "parents": [GOOGLE_DRIVE_FOLDER_ID],
         },
         media_body=media,
-        fields="id, webViewLink",
+        fields="webViewLink",
     ).execute()
 
-    drive_link = uploaded["webViewLink"]
-
     sheet_checks.append_row([
-        str(update.effective_user.id),
+        update.effective_user.id,
         update.effective_user.username,
-        context.user_data.get("fio", ""),
-        context.user_data.get("house", ""),
-        context.user_data.get("phone", ""),
-        drive_link,
+        context.user_data.get("fio"),
+        context.user_data.get("house"),
+        context.user_data.get("phone"),
+        uploaded["webViewLink"],
         "",
         datetime.now().strftime("%Y-%m-%d"),
         "",
-        "ДА" if duplicate else "НЕТ",
-        file_unique_id,
+        "НЕТ",
+        file.file_unique_id,
     ])
 
-    if duplicate:
-        await message.reply_text(
-            "⚠️ Этот чек уже был загружен ранее.\n"
-            "Пожалуйста, отправьте другой чек."
-        )
-    else:
-        await message.reply_text(
-            "✅ Чек успешно принят и сохранён.\n"
-            "Спасибо!"
-        )
-
+    await msg.reply_text("✅ Чек принят. Спасибо!")
     return WAIT_CHECK
 
 
-# ================== MAIN ==================
+# ================= MAIN =================
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN отсутствует — бот не запущен")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -197,18 +202,16 @@ def main():
             ASK_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_fio)],
             ASK_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_house)],
             ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
-            WAIT_CHECK: [
-                MessageHandler(filters.PHOTO | filters.Document.ALL, handle_check)
-            ],
+            WAIT_CHECK: [MessageHandler(filters.PHOTO | filters.Document.ALL, handle_check)],
         },
         fallbacks=[CommandHandler("start", start)],
     )
 
-    application.add_handler(conv)
+    app.add_handler(conv)
 
-    application.run_webhook(
+    app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
+        port=PORT,
         webhook_url=WEBHOOK_URL,
     )
 
