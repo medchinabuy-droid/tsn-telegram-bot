@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from io import BytesIO
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,15 +25,25 @@ logger = logging.getLogger(__name__)
 
 # ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # может быть пустым
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, DRIVE_FOLDER_ID, CREDS_JSON]):
-    raise RuntimeError("❌ Не все ENV заданы")
+missing = []
+if not BOT_TOKEN:
+    missing.append("BOT_TOKEN")
+if not SPREADSHEET_ID:
+    missing.append("SPREADSHEET_ID")
+if not DRIVE_FOLDER_ID:
+    missing.append("DRIVE_FOLDER_ID")
+if not CREDS_JSON:
+    missing.append("GOOGLE_CREDENTIALS_JSON")
 
-logger.info("✅ ENV OK")
+if missing:
+    logger.error(f"❌ Отсутствуют ENV: {', '.join(missing)}")
+else:
+    logger.info("✅ ENV проверены")
 
 # ----------------- GOOGLE -----------------
 creds_dict = json.loads(CREDS_JSON)
@@ -45,6 +55,7 @@ credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 gc = gspread.authorize(credentials)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+
 sheet1 = spreadsheet.worksheet("Лист 1")
 sheet2 = spreadsheet.worksheet("Лист 2")
 
@@ -66,7 +77,7 @@ def find_user_row(telegram_id):
 
 
 def is_duplicate(file_unique_id):
-    ids = sheet2.col_values(11)  # File_Unique_ID
+    ids = sheet2.col_values(11)
     return file_unique_id in ids
 
 
@@ -78,18 +89,18 @@ def upload_to_drive(filename, content, mime):
         media_body=media,
         fields="id, webViewLink"
     ).execute()
-    logger.info(f"📤 Загружен файл: {file['webViewLink']}")
     return file["webViewLink"]
-
 
 # ----------------- HANDLERS -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg = update.effective_user
-    row_num, row = find_user_row(tg.id)
+    _, row = find_user_row(tg.id)
 
     if row:
         context.user_data["fio"] = row.get("ФИО")
-        text = f"👋 Здравствуйте, {row.get('ФИО')}!\n\nПришлите фото или PDF чека."
+        await update.message.reply_text(
+            f"👋 Здравствуйте, {row.get('ФИО')}!\n\nПришлите фото или PDF чека."
+        )
         return CHECK
     else:
         await update.message.reply_text("Введите ФИО:")
@@ -114,7 +125,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     await update.message.reply_text(
-        f"✅ Данные сохранены, {context.user_data['fio']}!\n\nТеперь отправьте чек (фото или PDF)."
+        f"✅ Данные сохранены, {context.user_data['fio']}!\n\nТеперь отправьте чек."
     )
     return CHECK
 
@@ -136,14 +147,11 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHECK
 
     if is_duplicate(file.file_unique_id):
-        await message.reply_text(
-            "⚠️ Этот чек уже был загружен ранее.\n\n📎 Отправьте другой чек."
-        )
+        await message.reply_text("⚠️ Этот чек уже был загружен ранее.")
         return CHECK
 
     tg_file = await context.bot.get_file(file.file_id)
     content = await tg_file.download_as_bytearray()
-
     link = upload_to_drive(filename, content, mime)
 
     sheet2.append_row([
@@ -161,18 +169,11 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
     ])
 
-    await message.reply_text(
-        "✅ Чек принят и сохранён.\nСпасибо!"
-    )
+    await message.reply_text("✅ Чек принят. Спасибо!")
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Отменено")
-    return ConversationHandler.END
-
-
-# ----------------- APP -----------------
+# ----------------- MAIN -----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -183,16 +184,21 @@ def main():
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
             CHECK: [MessageHandler(filters.ALL, handle_check)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[],
     )
 
     app.add_handler(conv)
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-        webhook_url=WEBHOOK_URL,
-    )
+    if WEBHOOK_URL:
+        logger.info("🚀 Запуск webhook")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000)),
+            webhook_url=WEBHOOK_URL,
+        )
+    else:
+        logger.warning("⚠️ WEBHOOK_URL не задан — запуск polling")
+        app.run_polling()
 
 
 if __name__ == "__main__":
