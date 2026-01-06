@@ -1,14 +1,15 @@
 import os
 import json
 import logging
-from io import BytesIO
 from datetime import datetime
+from io import BytesIO
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -18,162 +19,181 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# -------------------- LOGGING --------------------
+# ----------------- ЛОГИ -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------------------- ENV --------------------
+# ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not all([BOT_TOKEN, WEBHOOK_SECRET, RENDER_URL, CREDS_JSON]):
-    raise RuntimeError("❌ ENV переменные не заданы")
+if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, DRIVE_FOLDER_ID, CREDS_JSON]):
+    raise RuntimeError("❌ Не все ENV заданы")
 
 logger.info("✅ ENV OK")
 
-# -------------------- GOOGLE --------------------
-creds = Credentials.from_service_account_info(
-    json.loads(CREDS_JSON),
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ],
-)
+# ----------------- GOOGLE -----------------
+creds_dict = json.loads(CREDS_JSON)
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
-gc = gspread.authorize(creds)
-spreadsheet = gc.open("TSN")
-sheet_users = spreadsheet.worksheet("Лист 1")
-sheet_checks = spreadsheet.worksheet("Лист 2")
+gc = gspread.authorize(credentials)
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+sheet1 = spreadsheet.worksheet("Лист 1")
+sheet2 = spreadsheet.worksheet("Лист 2")
 
-drive = build("drive", "v3", credentials=creds)
+drive = build("drive", "v3", credentials=credentials)
 
 logger.info("📄 Google Sheets подключены")
 logger.info("📁 Google Drive подключен")
 
-# -------------------- HELPERS --------------------
-def find_user(telegram_id: int):
-    rows = sheet_users.get_all_records()
-    for r in rows:
-        if str(r.get("Telegram_ID")) == str(telegram_id):
-            return r
-    return None
+# ----------------- STATES -----------------
+FIO, PHONE, CHECK = range(3)
+
+# ----------------- HELPERS -----------------
+def find_user_row(telegram_id):
+    rows = sheet1.get_all_records()
+    for idx, row in enumerate(rows, start=2):
+        if str(row.get("Telegram_ID")) == str(telegram_id):
+            return idx, row
+    return None, None
 
 
-def is_duplicate(file_unique_id: str) -> bool:
-    col = sheet_checks.col_values(11)
-    return file_unique_id in col
+def is_duplicate(file_unique_id):
+    ids = sheet2.col_values(11)  # File_Unique_ID
+    return file_unique_id in ids
 
 
-def upload_to_drive(filename: str, file_bytes: bytes) -> str:
-    media = MediaIoBaseUpload(BytesIO(file_bytes), resumable=True)
+def upload_to_drive(filename, content, mime):
+    media = MediaIoBaseUpload(BytesIO(content), mimetype=mime)
+    body = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
     file = drive.files().create(
-        body={"name": filename},
+        body=body,
         media_body=media,
-        fields="id, webViewLink",
+        fields="id, webViewLink"
     ).execute()
+    logger.info(f"📤 Загружен файл: {file['webViewLink']}")
     return file["webViewLink"]
 
-# -------------------- HANDLERS --------------------
+
+# ----------------- HANDLERS -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    user = find_user(tg_id)
+    tg = update.effective_user
+    row_num, row = find_user_row(tg.id)
 
-    if user:
-        await update.message.reply_text(
-            f"👋 Здравствуйте, {user['ФИО']}!\n\n"
-            "📎 Пожалуйста, отправьте фото или PDF чека."
-        )
+    if row:
+        context.user_data["fio"] = row.get("ФИО")
+        text = f"👋 Здравствуйте, {row.get('ФИО')}!\n\nПришлите фото или PDF чека."
+        return CHECK
     else:
-        await update.message.reply_text(
-            "👋 Добро пожаловать!\n\n"
-            "📎 Пожалуйста, отправьте фото или PDF чека."
-        )
+        await update.message.reply_text("Введите ФИО:")
+        return FIO
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    tg_id = msg.from_user.id
-    username = msg.from_user.username or ""
 
-    await msg.reply_text("⏳ Чек получен. Проверяю...")
+async def get_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["fio"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Введите телефон\nПример: +79261234567"
+    )
+    return PHONE
 
-    if msg.photo:
-        file = msg.photo[-1]
-        ext = "jpg"
-    elif msg.document:
-        file = msg.document
-        ext = msg.document.file_name.split(".")[-1]
+
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+
+    sheet1.append_row([
+        "", context.user_data["fio"], update.effective_user.id,
+        context.user_data["phone"], "", "", "", "", "Новый", "Житель",
+        "", "Telegram", "", "", "Telegram"
+    ])
+
+    await update.message.reply_text(
+        f"✅ Данные сохранены, {context.user_data['fio']}!\n\nТеперь отправьте чек (фото или PDF)."
+    )
+    return CHECK
+
+
+async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    tg = update.effective_user
+
+    if message.photo:
+        file = message.photo[-1]
+        mime = "image/jpeg"
+        filename = f"check_{tg.id}_{file.file_unique_id}.jpg"
+    elif message.document:
+        file = message.document
+        mime = file.mime_type
+        filename = file.file_name
     else:
-        await msg.reply_text("❌ Это не файл и не фото.")
-        return
+        await message.reply_text("❌ Отправьте фото или PDF.")
+        return CHECK
 
     if is_duplicate(file.file_unique_id):
-        await msg.reply_text(
-            "⚠️ Этот чек уже был загружен ранее.\n\n"
-            "📎 Отправьте **другой чек**."
+        await message.reply_text(
+            "⚠️ Этот чек уже был загружен ранее.\n\n📎 Отправьте другой чек."
         )
-        return
+        return CHECK
 
-    try:
-        tg_file = await file.get_file()
-        bio = BytesIO()
-        await tg_file.download_to_memory(out=bio)
-        bio.seek(0)
+    tg_file = await context.bot.get_file(file.file_id)
+    content = await tg_file.download_as_bytearray()
 
-        await msg.reply_text("☁️ Загружаю чек в Google Drive...")
+    link = upload_to_drive(filename, content, mime)
 
-        link = upload_to_drive(
-            f"check_{tg_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}",
-            bio.read(),
-        )
+    sheet2.append_row([
+        tg.id,
+        tg.username,
+        context.user_data.get("fio"),
+        "",
+        context.user_data.get("phone"),
+        link,
+        "",
+        datetime.now().strftime("%d.%m.%Y"),
+        "",
+        "Нет",
+        file.file_unique_id,
+        "",
+    ])
 
-        user = find_user(tg_id)
-        fio = user["ФИО"] if user else ""
+    await message.reply_text(
+        "✅ Чек принят и сохранён.\nСпасибо!"
+    )
+    return ConversationHandler.END
 
-        sheet_checks.append_row([
-            tg_id,
-            username,
-            fio,
-            "",
-            user.get("Телефон", "") if user else "",
-            link,
-            "",
-            datetime.now().strftime("%d.%m.%Y"),
-            "",
-            "Нет",
-            file.file_unique_id,
-        ])
 
-        await msg.reply_text(
-            "✅ Чек успешно сохранён!\n\n"
-            "📂 Файл загружен на Google Drive\n"
-            "📄 Данные записаны в таблицу\n\n"
-            "Спасибо!"
-        )
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено")
+    return ConversationHandler.END
 
-    except Exception as e:
-        logger.exception("Ошибка при обработке файла")
-        await msg.reply_text(
-            "❌ Произошла ошибка при обработке чека.\n"
-            "Попробуйте отправить файл ещё раз."
-        )
 
-# -------------------- APP --------------------
+# ----------------- APP -----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_fio)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            CHECK: [MessageHandler(filters.ALL, handle_check)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(conv)
 
     app.run_webhook(
         listen="0.0.0.0",
-        port=10000,
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{RENDER_URL}/{WEBHOOK_SECRET}",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=WEBHOOK_URL,
     )
 
-    logger.info("🚀 Webhook запущен")
 
 if __name__ == "__main__":
     main()
