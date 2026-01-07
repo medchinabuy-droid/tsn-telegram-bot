@@ -1,10 +1,11 @@
 import os
 import json
-import logging
 import asyncio
+import logging
 import time
 from typing import Set
 
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,14 +15,14 @@ from telegram.ext import (
     filters,
 )
 
-# ================== LOGGING ==================
+# ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ================== ENV ==================
+# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 GOOGLE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -31,14 +32,14 @@ PORT = int(os.getenv("PORT", 10000))
 if not BOT_TOKEN or not RENDER_URL:
     raise RuntimeError("❌ BOT_TOKEN или RENDER_EXTERNAL_URL не заданы")
 
-WEBHOOK_URL = f"{RENDER_URL}/webhook"
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 
-# ================== GOOGLE ==================
-gsheet = None
+# ================= GOOGLE =================
 worksheet_checks = None
 
 def init_google():
-    global gsheet, worksheet_checks
+    global worksheet_checks
 
     if not GOOGLE_JSON:
         logger.error("❌ GOOGLE_SERVICE_ACCOUNT_JSON отсутствует")
@@ -46,15 +47,13 @@ def init_google():
 
     try:
         import gspread
-
         creds = json.loads(GOOGLE_JSON)
         gc = gspread.service_account_from_dict(creds)
 
-        gsheet = gc.open(SPREADSHEET_NAME)
+        sh = gc.open(SPREADSHEET_NAME)
 
-        titles = [ws.title for ws in gsheet.worksheets()]
-        if "TSN_CHECKS" not in titles:
-            worksheet_checks = gsheet.add_worksheet(
+        if "TSN_CHECKS" not in [ws.title for ws in sh.worksheets()]:
+            worksheet_checks = sh.add_worksheet(
                 title="TSN_CHECKS", rows=1000, cols=6
             )
             worksheet_checks.append_row([
@@ -66,30 +65,30 @@ def init_google():
                 "status",
             ])
         else:
-            worksheet_checks = gsheet.worksheet("TSN_CHECKS")
+            worksheet_checks = sh.worksheet("TSN_CHECKS")
 
         logger.info("✅ Google Sheets подключён")
 
     except Exception as e:
-        logger.exception(f"❌ Ошибка Google Sheets: {e}")
+        logger.exception(f"❌ Google error: {e}")
 
-# ================== MEMORY ==================
+# ================= MEMORY =================
 used_files: Set[str] = set()
 last_upload: dict[int, float] = {}
-ANTI_FLOOD_SECONDS = 5
+ANTI_FLOOD = 5
 
 def is_flood(user_id: int) -> bool:
     now = time.time()
     last = last_upload.get(user_id, 0)
     last_upload[user_id] = now
-    return now - last < ANTI_FLOOD_SECONDS
+    return now - last < ANTI_FLOOD
 
-# ================== HANDLERS ==================
+# ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n\n"
         "📸 Отправь фото или PDF чека.\n"
-        "♻️ Дубликаты автоматически отсеиваются."
+        "♻️ Дубликаты отсеиваются автоматически."
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,7 +100,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if photo.file_unique_id in used_files:
-        await update.message.reply_text("♻️ Этот чек уже был загружен ранее")
+        await update.message.reply_text("♻️ Этот чек уже был")
         return
 
     used_files.add(photo.file_unique_id)
@@ -116,39 +115,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "OK",
         ])
 
-    await update.message.reply_text("✅ Чек принят и сохранён")
+    await update.message.reply_text("✅ Чек принят")
 
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("OK")
+# ================= WEBHOOK =================
+async def telegram_webhook(request: web.Request):
+    data = await request.json()
+    update = Update.de_json(data, request.app["telegram_app"].bot)
+    await request.app["telegram_app"].process_update(update)
+    return web.Response(text="ok")
 
-# ================== CLEANUP ==================
-async def cleanup_task():
+# ================= CLEANUP =================
+async def cleanup():
     while True:
         await asyncio.sleep(3600)
         used_files.clear()
-        logger.info("🧹 Очистка file_unique_id")
+        logger.info("🧹 Очистка дублей")
 
-# ================== MAIN ==================
+# ================= MAIN =================
 async def main():
     init_google()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    telegram_app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("health", health))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    await application.initialize()
-    await application.bot.set_webhook(WEBHOOK_URL)
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+    await telegram_app.start()
 
     logger.info(f"🌍 Webhook установлен: {WEBHOOK_URL}")
 
-    application.create_task(cleanup_task())
+    # aiohttp server
+    app = web.Application()
+    app["telegram_app"] = telegram_app
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
-    await application.start()
-    await application.bot.initialize()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-    await asyncio.Event().wait()  # держим процесс живым
+    logger.info(f"🚀 Сервер слушает порт {PORT}")
+
+    telegram_app.create_task(cleanup())
+
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
