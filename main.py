@@ -1,170 +1,111 @@
 import os
 import json
-import asyncio
 import logging
-import time
-from typing import Set
+import asyncio
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
-# ================= LOGGING =================
+# =========================
+# ЛОГИ
+# =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ================= ENV =================
+# =========================
+# ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxxx.onrender.com/webhook
+PORT = int(os.getenv("PORT", "10000"))
 GOOGLE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "TSN")
-PORT = int(os.getenv("PORT", 10000))
 
-if not BOT_TOKEN or not RENDER_URL:
-    raise RuntimeError("❌ BOT_TOKEN или RENDER_EXTERNAL_URL не заданы")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не задан")
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
+if not WEBHOOK_URL:
+    raise RuntimeError("❌ WEBHOOK_URL не задан")
 
-# ================= GOOGLE =================
-worksheet_checks = None
+# =========================
+# TELEGRAM HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Бот запущен и работает")
 
-def init_google():
-    global worksheet_checks
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 pong")
 
+# =========================
+# GOOGLE CHECK (не падаем)
+# =========================
+def check_google_creds():
     if not GOOGLE_JSON:
         logger.error("❌ GOOGLE_SERVICE_ACCOUNT_JSON отсутствует")
-        return
-
+        return None
     try:
-        import gspread
-        creds = json.loads(GOOGLE_JSON)
-        gc = gspread.service_account_from_dict(creds)
-
-        sh = gc.open(SPREADSHEET_NAME)
-
-        if "TSN_CHECKS" not in [ws.title for ws in sh.worksheets()]:
-            worksheet_checks = sh.add_worksheet(
-                title="TSN_CHECKS", rows=1000, cols=6
-            )
-            worksheet_checks.append_row([
-                "timestamp",
-                "telegram_id",
-                "username",
-                "file_id",
-                "file_unique_id",
-                "status",
-            ])
-        else:
-            worksheet_checks = sh.worksheet("TSN_CHECKS")
-
-        logger.info("✅ Google Sheets подключён")
-
+        return json.loads(GOOGLE_JSON)
     except Exception as e:
-        logger.exception(f"❌ Google error: {e}")
+        logger.error(f"❌ Ошибка GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+        return None
 
-# ================= MEMORY =================
-used_files: Set[str] = set()
-last_upload: dict[int, float] = {}
-ANTI_FLOOD = 5
+# =========================
+# HTTP SERVER (Render требует порт)
+# =========================
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/webhook":
+            self.send_response(404)
+            self.end_headers()
+            return
 
-def is_flood(user_id: int) -> bool:
-    now = time.time()
-    last = last_upload.get(user_id, 0)
-    last_upload[user_id] = now
-    return now - last < ANTI_FLOOD
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
 
-# ================= HANDLERS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "📸 Отправь фото или PDF чека.\n"
-        "♻️ Дубликаты отсеиваются автоматически."
-    )
+        asyncio.run(application.update_queue.put(Update.de_json(
+            json.loads(body), application.bot
+        )))
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    photo = update.message.photo[-1]
+        self.send_response(200)
+        self.end_headers()
 
-    if is_flood(user.id):
-        await update.message.reply_text("⏳ Подожди пару секунд")
-        return
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-    if photo.file_unique_id in used_files:
-        await update.message.reply_text("♻️ Этот чек уже был")
-        return
-
-    used_files.add(photo.file_unique_id)
-
-    if worksheet_checks:
-        worksheet_checks.append_row([
-            int(time.time()),
-            user.id,
-            user.username or "",
-            photo.file_id,
-            photo.file_unique_id,
-            "OK",
-        ])
-
-    await update.message.reply_text("✅ Чек принят")
-
-# ================= WEBHOOK =================
-async def telegram_webhook(request: web.Request):
-    data = await request.json()
-    update = Update.de_json(data, request.app["telegram_app"].bot)
-    await request.app["telegram_app"].process_update(update)
-    return web.Response(text="ok")
-
-# ================= CLEANUP =================
-async def cleanup():
-    while True:
-        await asyncio.sleep(3600)
-        used_files.clear()
-        logger.info("🧹 Очистка дублей")
-
-# ================= MAIN =================
+# =========================
+# MAIN
+# =========================
 async def main():
-    init_google()
+    global application
 
-    telegram_app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    check_google_creds()
 
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(WEBHOOK_URL)
-    await telegram_app.start()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ping", ping))
 
+    await application.bot.set_webhook(WEBHOOK_URL)
     logger.info(f"🌍 Webhook установлен: {WEBHOOK_URL}")
 
-    # aiohttp server
-    app = web.Application()
-    app["telegram_app"] = telegram_app
-    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+    await application.initialize()
+    await application.start()
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
+    logger.info(f"🚀 HTTP сервер запущен на порту {PORT}")
+    server.serve_forever()
 
-    logger.info(f"🚀 Сервер слушает порт {PORT}")
-
-    telegram_app.create_task(cleanup())
-
-    await asyncio.Event().wait()
-
+# =========================
+# ENTRY
+# =========================
 if __name__ == "__main__":
     asyncio.run(main())
