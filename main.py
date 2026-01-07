@@ -1,11 +1,10 @@
 import os
 import json
-import io
-import asyncio
 import logging
+import asyncio
 from datetime import datetime
-from aiohttp import web
 
+from aiohttp import web
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -23,165 +22,222 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import io
 
-# ================== ENV ==================
-
+# -------------------- НАСТРОЙКИ --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+
 PORT = int(os.getenv("PORT", 10000))
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://tsn-telegram-bot.onrender.com{WEBHOOK_PATH}"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ================== LOG ==================
+# -------------------- GOOGLE --------------------
+creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if not creds_json:
+    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON отсутствует")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger(__name__)
+creds_dict = json.loads(creds_json)
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
-# ================== GOOGLE ==================
+gc = gspread.authorize(credentials)
+spreadsheet = gc.open(SPREADSHEET_NAME)
 
-if not GOOGLE_CREDENTIALS_JSON:
-    raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задан")
+sheet_users = spreadsheet.worksheet("Реестр")
+sheet_checks = spreadsheet.worksheet("Чеки")
+sheet_req = spreadsheet.worksheet("Реквизиты")
 
-creds = Credentials.from_service_account_info(
-    json.loads(GOOGLE_CREDENTIALS_JSON),
-    scopes=[
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/spreadsheets"
-    ]
-)
+drive_service = build("drive", "v3", credentials=credentials)
 
-gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-drive = build("drive", "v3", credentials=creds)
-
-log.info("✅ Google Sheets и Drive готовы")
-
-# ================== DRIVE ==================
-
-def get_folder_id(name: str) -> str:
-    res = drive.files().list(
-        q=f"name='{name}' and mimeType='application/vnd.google-apps.folder'",
-        fields="files(id)"
-    ).execute()
-    if res["files"]:
-        return res["files"][0]["id"]
-
-    folder = drive.files().create(
-        body={"name": name, "mimeType": "application/vnd.google-apps.folder"},
-        fields="id"
-    ).execute()
-    return folder["id"]
-
-FOLDER_ID = get_folder_id("TSN_CHECKS")
-
-# ================== UI ==================
-
-KB_START = ReplyKeyboardMarkup(
+# -------------------- UI --------------------
+START_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("🚀 Начать")]],
     resize_keyboard=True
 )
 
-UPLOAD_TEXT = (
-    "📸 <b>Загрузите чек</b>\n\n"
-    "1️⃣ Нажмите <b>📎 скрепку</b>\n"
-    "2️⃣ Выберите <b>Фото</b> или <b>Файл (PDF)</b>\n"
-    "3️⃣ Отправьте чек\n\n"
-    "❗ Текст вводить не нужно"
+REQ_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📄 Реквизиты")]],
+    resize_keyboard=True
 )
 
-# ================== HANDLERS ==================
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ --------------------
+def find_user_row(tg_id):
+    rows = sheet_users.get_all_records()
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("Telegram_ID")) == str(tg_id):
+            return i, r
+    return None, None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["state"] = "START"
-    await update.message.reply_text(
-        "👋 Добро пожаловать!\nНажмите кнопку ниже ⬇️",
-        reply_markup=KB_START
-    )
+def upload_to_drive(file_bytes, filename, mime):
+    folder_name = "TSN_CHECKS"
 
-async def press_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["state"] = "WAIT_FILE"
-    await update.message.reply_text(
-        UPLOAD_TEXT,
-        parse_mode="HTML"
-    )
+    folders = drive_service.files().list(
+        q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+    ).execute().get("files", [])
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("state")
+    if folders:
+        folder_id = folders[0]["id"]
+    else:
+        folder = drive_service.files().create(
+            body={"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+        ).execute()
+        folder_id = folder["id"]
 
-    if state == "WAIT_FILE":
-        await update.message.reply_text(
-            "📎 Я жду <b>фото или PDF чека</b>\n"
-            "Нажмите скрепку ⬇️",
-            parse_mode="HTML"
-        )
-        return
-
-    await update.message.reply_text(
-        "Нажмите «🚀 Начать»",
-        reply_markup=KB_START
-    )
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != "WAIT_FILE":
-        await update.message.reply_text("Нажмите «🚀 Начать»")
-        return
-
-    tg_file = None
-    filename = ""
-
-    if update.message.photo:
-        photo = update.message.photo[-1]
-        tg_file = await photo.get_file()
-        filename = f"check_{photo.file_unique_id}.jpg"
-
-    elif update.message.document:
-        doc = update.message.document
-        tg_file = await doc.get_file()
-        filename = f"check_{doc.file_unique_id}_{doc.file_name}"
-
-    file_bytes = await tg_file.download_as_bytearray()
-
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), resumable=False)
-
-    uploaded = drive.files().create(
-        body={"name": filename, "parents": [FOLDER_ID]},
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime)
+    file = drive_service.files().create(
+        body={"name": filename, "parents": [folder_id]},
         media_body=media,
-        fields="webViewLink"
+        fields="id, webViewLink"
     ).execute()
 
-    sheet.append_row([
-        update.effective_user.full_name,
-        update.effective_user.id,
-        datetime.now().strftime("%d.%m.%Y %H:%M"),
-        uploaded["webViewLink"]
-    ])
+    return file["webViewLink"]
 
-    context.user_data["state"] = "SAVED"
-
+# -------------------- ХЭНДЛЕРЫ --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Чек принят!\nСпасибо 🙌",
-        reply_markup=KB_START
+        "👋 Добро пожаловать!\nНажмите «🚀 Начать»",
+        reply_markup=START_KB
     )
 
-# ================== WEB ==================
+async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    row, data = find_user_row(tg_id)
 
-async def webhook_handler(request):
-    data = await request.json()
-    await app.process_update(Update.de_json(data, app.bot))
-    return web.Response(text="OK")
+    if data:
+        await update.message.reply_text(
+            f"👋 Здравствуйте, {data.get('ФИО')}!\n\n"
+            "📎 Прикрепите фото или PDF чека.\n"
+            "👉 Нажмите на значок 📎",
+            reply_markup=REQ_KB
+        )
+    else:
+        context.user_data["step"] = "fio"
+        await update.message.reply_text("✍️ Укажите ФИО:")
 
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    tg_id = update.effective_user.id
+
+    # ---- Админ ----
+    if tg_id in ADMIN_IDS and text.isdigit():
+        rows = sheet_users.get_all_records()
+        for r in rows:
+            if str(r.get("Участок")) == text:
+                if r.get("Статус") != "Оплачено":
+                    await update.message.reply_text(
+                        f"🏠 Участок {text}\n"
+                        f"👤 {r.get('ФИО')}\n"
+                        f"💰 Долг: {r.get('Сумма')}\n"
+                        f"📅 Дата: {r.get('Дата')}\n"
+                        f"🔔 Напоминание: {r.get('Дата_напоминания')}\n"
+                        f"📌 Статус: {r.get('Статус')}"
+                    )
+                else:
+                    await update.message.reply_text("✅ Задолженностей нет")
+                return
+        await update.message.reply_text("❌ Участок не найден")
+        return
+
+    step = context.user_data.get("step")
+
+    if step == "fio":
+        context.user_data["fio"] = text
+        context.user_data["step"] = "plot"
+        await update.message.reply_text("🏠 Укажите номер участка:")
+    elif step == "plot":
+        context.user_data["plot"] = text
+        context.user_data["step"] = "phone"
+        await update.message.reply_text(
+            "📞 Укажите номер телефона\nПример: +79261234567"
+        )
+    elif step == "phone":
+        if not text.startswith("+7") or len(text) < 12:
+            await update.message.reply_text(
+                "❌ Неверный формат\nПример: +79261234567"
+            )
+            return
+
+        sheet_users.append_row([
+            context.user_data["plot"],
+            context.user_data["fio"],
+            tg_id,
+            text,
+            "", "", "", datetime.now().strftime("%d.%m.%Y"),
+            "Ожидает",
+            "Пользователь",
+            "", "", "", "", ""
+        ])
+
+        await update.message.reply_text(
+            "✅ Данные сохранены.\nСпасибо!\n\n"
+            "📎 Теперь прикрепите чек.\n"
+            "👉 Нажмите на 📎",
+            reply_markup=REQ_KB
+        )
+        context.user_data.clear()
+
+    elif text == "📄 Реквизиты":
+        data = sheet_req.get_all_records()[0]
+        await update.message.reply_text(data["Текст"])
+        await update.message.reply_text(data["QR_URL"])
+    else:
+        await update.message.reply_text(
+            "🤖 Я не понял сообщение.\nНажмите «🚀 Начать»",
+            reply_markup=START_KB
+        )
+
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document or update.message.photo[-1]
+    file = await doc.get_file()
+
+    # проверка дубля
+    rows = sheet_checks.col_values(2)
+    if doc.file_unique_id in rows:
+        await update.message.reply_text("⚠️ Этот чек уже был загружен")
+        return
+
+    file_bytes = await file.download_as_bytearray()
+    link = upload_to_drive(
+        file_bytes,
+        doc.file_name or "check.jpg",
+        doc.mime_type or "image/jpeg"
+    )
+
+    sheet_checks.append_row([
+        update.effective_user.id,
+        doc.file_unique_id,
+        link,
+        datetime.now().strftime("%d.%m.%Y %H:%M")
+    ])
+
+    await update.message.reply_text(
+        "✅ Чек принят!\nСпасибо за оплату 🙌"
+    )
+
+# -------------------- WEBHOOK SERVER --------------------
 async def health(request):
     return web.Response(text="OK")
 
-async def run_web():
+async def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex("^🚀 Начать$"), begin))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, file_handler))
+
+    await app.initialize()
+    await app.bot.set_webhook(WEBHOOK_URL)
+    await app.start()
+
     web_app = web.Application()
-    web_app.router.add_post(WEBHOOK_PATH, webhook_handler)
     web_app.router.add_get("/", health)
 
     runner = web.AppRunner(web_app)
@@ -189,29 +245,8 @@ async def run_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    log.info(f"🚀 HTTP сервер запущен на порту {PORT}")
-
-# ================== MAIN ==================
-
-async def main():
-    global app
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^🚀 Начать$"), press_start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    await app.bot.set_webhook(WEBHOOK_URL)
-    await app.initialize()
-    await app.start()
-
-    await run_web()
-
-    log.info("🌍 Бот полностью запущен")
-
-    while True:
-        await asyncio.sleep(3600)
+    logger.info(f"🚀 HTTP сервер запущен на порту {PORT}")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
