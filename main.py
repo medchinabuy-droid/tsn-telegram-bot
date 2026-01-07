@@ -1,41 +1,39 @@
 import os
 import json
 import logging
-import asyncio
 
 from aiohttp import web
 
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 # =======================
-# НАСТРОЙКИ / ENV
+# ENV
 # =======================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxxx.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
-
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не задан")
-
-if not WEBHOOK_URL:
-    raise RuntimeError("❌ WEBHOOK_URL не задан")
-
-if not GOOGLE_CREDENTIALS_JSON:
-    raise RuntimeError("❌ GOOGLE_CREDENTIALS_JSON не задан")
+if not all([BOT_TOKEN, WEBHOOK_URL, GOOGLE_CREDENTIALS_JSON]):
+    raise RuntimeError("❌ Не заданы ENV переменные")
 
 # =======================
-# ЛОГИ
+# LOGGING
 # =======================
 
 logging.basicConfig(
@@ -48,8 +46,8 @@ logger = logging.getLogger(__name__)
 # GOOGLE SHEETS
 # =======================
 
-def init_google_sheets():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+def init_google():
+    creds = json.loads(GOOGLE_CREDENTIALS_JSON)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -57,7 +55,7 @@ def init_google_sheets():
     ]
 
     credentials = Credentials.from_service_account_info(
-        creds_dict,
+        creds,
         scopes=scopes,
     )
 
@@ -66,33 +64,56 @@ def init_google_sheets():
     return gc
 
 
-gc = init_google_sheets()
+gc = init_google()
 
 # =======================
-# TELEGRAM HANDLERS
+# KEYBOARDS
+# =======================
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("🚀 Начать")]],
+    resize_keyboard=True,
+)
+
+# =======================
+# HANDLERS
 # =======================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Бот запущен и работает через Webhook!"
+        "👋 Добро пожаловать!\nНажмите «🚀 Начать»",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong")
+async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Кнопка «🚀 Начать» нажата!\n\nДальше будет логика бота.",
+    )
 
+
+async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Я не понял сообщение.\nНажмите «🚀 Начать».",
+        reply_markup=MAIN_KEYBOARD,
+    )
 
 # =======================
-# APP TELEGRAM
+# TELEGRAM APP
 # =======================
 
 application = Application.builder().token(BOT_TOKEN).build()
 
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("ping", ping))
+application.add_handler(
+    MessageHandler(filters.TEXT & filters.Regex("^🚀 Начать$"), handle_start_button)
+)
+application.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text)
+)
 
 # =======================
-# AIOHTTP WEB SERVER
+# AIOHTTP SERVER
 # =======================
 
 async def healthcheck(request):
@@ -110,10 +131,10 @@ async def on_startup(app):
     await application.initialize()
     await application.start()
 
-    webhook_full_url = f"{WEBHOOK_URL}/webhook"
-    await application.bot.set_webhook(webhook_full_url)
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    await application.bot.set_webhook(webhook_url)
 
-    logger.info(f"🌍 Webhook установлен: {webhook_full_url}")
+    logger.info(f"🌍 Webhook установлен: {webhook_url}")
     logger.info(f"🚀 HTTP сервер запущен на порту {PORT}")
 
 
@@ -125,7 +146,6 @@ async def on_shutdown(app):
 
 def main():
     app = web.Application()
-
     app.router.add_get("/", healthcheck)
     app.router.add_post("/webhook", telegram_webhook)
 
