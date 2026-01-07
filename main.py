@@ -23,7 +23,7 @@ from telegram.ext import (
     filters
 )
 
-# ---------------- НАСТРОЙКИ ----------------
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -34,11 +34,11 @@ ADMIN_USERNAMES = [
     if u.strip()
 ]
 
-# ---------------- ЛОГИ ----------------
+# ================= ЛОГИ =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- GOOGLE ----------------
+# ================= GOOGLE =================
 creds = Credentials.from_service_account_info(
     json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
     scopes=[
@@ -56,7 +56,7 @@ sheet_req = sh.worksheet("Реквизиты")
 
 drive = build("drive", "v3", credentials=creds)
 
-# ---------------- DRIVE ----------------
+# ================= DRIVE =================
 def get_folder(name):
     res = drive.files().list(
         q=f"name='{name}' and mimeType='application/vnd.google-apps.folder'",
@@ -64,6 +64,7 @@ def get_folder(name):
     ).execute()["files"]
     if res:
         return res[0]["id"]
+
     folder = drive.files().create(
         body={"name": name, "mimeType": "application/vnd.google-apps.folder"}
     ).execute()
@@ -71,7 +72,12 @@ def get_folder(name):
 
 FOLDER_ID = get_folder("TSN_CHECKS")
 
-# ---------------- КЛАВИАТУРА ----------------
+# ================= КНОПКИ =================
+START_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("🚀 Начать")]],
+    resize_keyboard=True
+)
+
 MAIN_KB = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📎 Загрузить чек")],
@@ -81,7 +87,7 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ---------------- ПОИСК ПОЛЬЗОВАТЕЛЯ ----------------
+# ================= ПОИСК ПОЛЬЗОВАТЕЛЯ =================
 def find_user(tg_id, phone=None):
     rows = sheet_users.get_all_records()
     for i, r in enumerate(rows, start=2):
@@ -92,15 +98,36 @@ def find_user(tg_id, phone=None):
             return r, i
     return None, None
 
-# ---------------- START ----------------
+# ================= /start =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Добро пожаловать!\nВведите номер телефона\n\n"
-        "👉 Пример: +7 926 123-45-67"
+        "👋 Добро пожаловать в бот ТСН «Искона-Парк»",
+        reply_markup=START_KB
     )
-    context.user_data["wait_phone"] = True
 
-# ---------------- ТЕЛЕФОН ----------------
+# ================= 🚀 НАЧАТЬ =================
+async def start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    data, _ = find_user(user.id)
+
+    if data:
+        context.user_data["fio"] = data["ФИО"]
+        context.user_data["phone"] = data["Телефон"]
+        context.user_data["house"] = data["Участок"]
+
+        await update.message.reply_text(
+            f"👋 {data['ФИО']}\n🏠 Дом: {data['Участок']}",
+            reply_markup=MAIN_KB
+        )
+    else:
+        context.user_data["wait_phone"] = True
+        await update.message.reply_text(
+            "📱 Введите номер телефона\n\n"
+            "👉 Пример: +7 926 123-45-67"
+        )
+
+# ================= ТЕЛЕФОН =================
 async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_phone"):
         return
@@ -124,10 +151,11 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_KB
     )
 
-# ---------------- МОИ ПЛАТЕЖИ ----------------
+# ================= МОИ ПЛАТЕЖИ =================
 async def my_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     rows = sheet_checks.get_all_records()
+
     items = [r for r in rows if str(r["telegram_id"]) == str(uid)]
 
     if not items:
@@ -140,7 +168,7 @@ async def my_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text)
 
-# ---------------- РЕКВИЗИТЫ ----------------
+# ================= РЕКВИЗИТЫ =================
 async def requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = sheet_req.get_all_records()[0]
     await update.message.reply_text(
@@ -151,7 +179,7 @@ async def requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"QR:\n{r['QR_оплата']}"
     )
 
-# ---------------- ЗАГРУЗКА ЧЕКА ----------------
+# ================= ЗАГРУЗКА ЧЕКА =================
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
@@ -188,7 +216,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Чек сохранён.", reply_markup=MAIN_KB)
 
-# ---------------- НАПОМИНАНИЯ ----------------
+# ================= НАПОМИНАНИЯ =================
 async def reminders(app: Application):
     today = date.today().strftime("%Y-%m-%d")
     rows = sheet_users.get_all_records()
@@ -203,7 +231,7 @@ async def reminders(app: Application):
             except:
                 pass
 
-# ---------------- MAIN ----------------
+# ================= MAIN =================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -212,6 +240,7 @@ def main():
     scheduler.start()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🚀 Начать$"), start_button))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("📄"), my_payments))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("💳"), requisites))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler))
