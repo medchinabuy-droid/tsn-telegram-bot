@@ -3,6 +3,7 @@ import json
 import re
 import logging
 from datetime import datetime
+import io
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -11,7 +12,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-import io
 
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +39,7 @@ sheet_users = sh.worksheet("Лист 1")
 sheet_checks = sh.worksheet("Лист 2")
 sheet_reqs = sh.worksheet("Реквизиты")
 
-# ---------------- KEYBOARD ----------------
+# ---------------- MENU ----------------
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🚀 Начать")],
@@ -62,8 +62,7 @@ def valid_phone(text): return bool(re.fullmatch(r"\+7\d{10}", text))
 def valid_house(text): return text.isdigit()
 
 def check_duplicate(file_unique_id):
-    ids = sheet_checks.col_values(11)
-    return file_unique_id in ids
+    return file_unique_id in sheet_checks.col_values(11)
 
 def upload_to_drive(file_bytes, filename, mime):
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime)
@@ -83,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         fio = sheet_users.cell(row, 2).value
         await update.message.reply_text(
-            f"👋 С возвращением, {fio}",
+            f"👋 С возвращением, {fio}\n\nℹ️ Используйте меню ⬇️",
             reply_markup=MAIN_MENU
         )
     else:
@@ -99,15 +98,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     step = context.user_data.get("step")
 
-    # ----- КНОПКА СТАРТ -----
+    # ---- START BUTTON ----
     if text == "🚀 Начать":
         await start(update, context)
         return
 
-    # ----- АДМИН: ЗАПРОС ДОЛГА ПО НОМЕРУ ДОМА -----
+    # ---- ADMIN: DEBT BY HOUSE ----
     if uid in ADMIN_IDS and text.isdigit():
-        rows = sheet_users.get_all_records()
-        for r in rows:
+        for r in sheet_users.get_all_records():
             if str(r.get("Участок")) == text:
                 await update.message.reply_text(
                     f"🏠 Участок {text}\n\n"
@@ -119,34 +117,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=MAIN_MENU
                 )
                 return
-        await update.message.reply_text(f"❌ Дом {text} не найден")
+        await update.message.reply_text(f"❌ Дом {text} не найден", reply_markup=MAIN_MENU)
         return
 
-    # ----- РЕКВИЗИТЫ -----
+    # ---- REQUISITES ----
     if text == "💳 Реквизиты":
-        r = sheet_reqs.get_all_records()[0]
+        row = sheet_reqs.row_values(2)
         await update.message.reply_text(
-            f"💳 Реквизиты:\n\n"
-            f"Банк: {r['Банк']}\n"
-            f"БИК: {r['БИК']}\n"
-            f"Получатель: {r['Получатель']}\n"
-            f"Счёт: {r['Счёт получателя']}\n"
-            f"ИНН: {r['ИНН']}\n\n"
-            f"🔗 QR:\n{r['QR_оплата']}",
+            "💳 Реквизиты:\n\n"
+            f"Банк: {row[0]}\n"
+            f"БИК: {row[1]}\n"
+            f"Счёт: {row[2]}\n"
+            f"Получатель: {row[3]}\n"
+            f"ИНН: {row[4]}\n\n"
+            f"🔗 QR:\n{row[5]}",
             reply_markup=MAIN_MENU
         )
         return
 
-    # ----- ЗАГРУЗКА ЧЕКА -----
+    # ---- UPLOAD CHECK ----
     if text == "📎 Загрузить чек":
         context.user_data["wait_check"] = True
-        await update.message.reply_text(
-            "📎 Отправьте фото или PDF чека",
-            reply_markup=MAIN_MENU
-        )
+        await update.message.reply_text("📎 Отправьте фото или PDF чека")
         return
 
-    # ----- РЕГИСТРАЦИЯ -----
+    # ---- REGISTRATION ----
     if step == "fio":
         if not valid_fio(text):
             await update.message.reply_text("❌ Введите имя и фамилию")
@@ -192,10 +187,10 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tg_file = await file.get_file()
-    file_bytes = await tg_file.download_as_bytearray()
+    data = await tg_file.download_as_bytearray()
 
     link = upload_to_drive(
-        file_bytes,
+        data,
         f"check_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         file.mime_type
     )
