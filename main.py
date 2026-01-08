@@ -93,41 +93,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU
         )
 
-# ---------------- DEBT (ADMIN) ----------------
-async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /debt 81")
-        return
-
-    house = context.args[0]
-    rows = sheet_users.get_all_records()
-
-    for r in rows:
-        if r.get("Участок") == house:
-            await update.message.reply_text(
-                f"🏠 Участок {house}\n"
-                f"ФИО: {r.get('ФИО')}\n"
-                f"Телефон: {r.get('Телефон')}\n"
-                f"Сумма: {r.get('Сумма')}\n"
-                f"Статус: {r.get('Статус')}\n"
-                f"Дата напоминания: {r.get('Дата_напоминания')}"
-            )
-            return
-
-    await update.message.reply_text("❌ Участок не найден")
-
 # ---------------- TEXT ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    uid = update.effective_user.id
     step = context.user_data.get("step")
 
+    # ----- КНОПКА СТАРТ -----
     if text == "🚀 Начать":
         await start(update, context)
         return
 
+    # ----- АДМИН: ЗАПРОС ДОЛГА ПО НОМЕРУ ДОМА -----
+    if uid in ADMIN_IDS and text.isdigit():
+        rows = sheet_users.get_all_records()
+        for r in rows:
+            if str(r.get("Участок")) == text:
+                await update.message.reply_text(
+                    f"🏠 Участок {text}\n\n"
+                    f"ФИО: {r.get('ФИО')}\n"
+                    f"Телефон: {r.get('Телефон')}\n"
+                    f"Сумма: {r.get('Сумма')}\n"
+                    f"Статус: {r.get('Статус')}\n"
+                    f"Дата напоминания: {r.get('Дата_напоминания')}",
+                    reply_markup=MAIN_MENU
+                )
+                return
+        await update.message.reply_text(f"❌ Дом {text} не найден")
+        return
+
+    # ----- РЕКВИЗИТЫ -----
     if text == "💳 Реквизиты":
         r = sheet_reqs.get_all_records()[0]
         await update.message.reply_text(
@@ -142,28 +137,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ----- ЗАГРУЗКА ЧЕКА -----
     if text == "📎 Загрузить чек":
         context.user_data["wait_check"] = True
         await update.message.reply_text(
-            "📎 Нажмите на скрепку 📎 и отправьте фото или PDF",
+            "📎 Отправьте фото или PDF чека",
             reply_markup=MAIN_MENU
         )
         return
 
+    # ----- РЕГИСТРАЦИЯ -----
     if step == "fio":
         if not valid_fio(text):
-            await update.message.reply_text("❌ Минимум имя и фамилия")
+            await update.message.reply_text("❌ Введите имя и фамилию")
             return
-        sheet_users.append_row(["", text, str(update.effective_user.id)])
+        sheet_users.append_row(["", text, str(uid)])
         context.user_data["step"] = "phone"
         await update.message.reply_text("📞 Телефон: +7926XXXXXXXX")
         return
 
     if step == "phone":
         if not valid_phone(text):
-            await update.message.reply_text("❌ Неверный формат телефона")
+            await update.message.reply_text("❌ Формат: +7926XXXXXXXX")
             return
-        row = find_user_row(update.effective_user.id)
+        row = find_user_row(uid)
         sheet_users.update_cell(row, 4, text)
         context.user_data["step"] = "house"
         await update.message.reply_text("🏠 Номер участка:")
@@ -173,10 +170,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not valid_house(text):
             await update.message.reply_text("❌ Только цифры")
             return
-        row = find_user_row(update.effective_user.id)
+        row = find_user_row(uid)
         sheet_users.update_cell(row, 1, text)
         context.user_data.clear()
-        await update.message.reply_text("✅ Регистрация завершена", reply_markup=MAIN_MENU)
+        await update.message.reply_text(
+            "✅ Регистрация завершена\n\nℹ️ Используйте меню ⬇️",
+            reply_markup=MAIN_MENU
+        )
 
 # ---------------- FILE ----------------
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,7 +188,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_unique_id = file.file_unique_id
 
     if check_duplicate(file_unique_id):
-        await msg.reply_text("❌ Этот чек уже был загружен ранее", reply_markup=MAIN_MENU)
+        await msg.reply_text("❌ Этот чек уже загружен ранее", reply_markup=MAIN_MENU)
         return
 
     tg_file = await file.get_file()
@@ -231,7 +231,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("debt", debt))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
