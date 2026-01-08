@@ -45,7 +45,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 # ---------------- HELPERS ----------------
 def find_user_row(tg_id: int):
-    ids = sheet_users.col_values(3)
+    ids = sheet_users.col_values(3)  # Telegram_ID
     for i, v in enumerate(ids, start=1):
         if v == str(tg_id):
             return i
@@ -54,13 +54,15 @@ def find_user_row(tg_id: int):
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    user_id = update.effective_user.id
 
     await update.message.reply_text(
         "👋 Добро пожаловать в ТСН «Искона-Парк»",
         reply_markup=MAIN_MENU,
     )
 
-    if not find_user_row(update.effective_user.id):
+    row = find_user_row(user_id)
+    if not row:
         context.user_data["step"] = "fio"
         await update.message.reply_text("Введите ФИО:")
     else:
@@ -72,16 +74,38 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     step = context.user_data.get("step")
 
-    if text == "🚀 Начать":
-        await start(update, context)
+    # --- КНОПКИ ---
+    if text == "📎 Загрузить чек":
+        await update.message.reply_text(
+            "📎 Пожалуйста, нажмите на скрепку 📎\n"
+            "и отправьте фото или PDF чека",
+            reply_markup=MAIN_MENU,
+        )
+        context.user_data["wait_check"] = True
         return
 
+    if text == "💳 Реквизиты":
+        rec = sheet_reqs.get_all_records()[0]
+        await update.message.reply_text(
+            f"💳 Реквизиты:\n\n"
+            f"Банк: {rec.get('Банк','')}\n"
+            f"БИК: {rec.get('БИК','')}\n"
+            f"Получатель: {rec.get('Получатель','')}\n"
+            f"Счёт: {rec.get('Счёт получателя','')}\n"
+            f"ИНН: {rec.get('ИНН','')}",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    # --- РЕГИСТРАЦИЯ ---
     if step == "fio":
         sheet_users.append_row(
             ["", text, str(user.id), "", "", "", "", "", "", "", "", "", "", ""]
         )
         context.user_data["step"] = "phone"
-        await update.message.reply_text("📞 Телефон:")
+        await update.message.reply_text(
+            "📞 Укажите телефон\nпример: +79261234567"
+        )
         return
 
     if step == "phone":
@@ -95,17 +119,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = find_user_row(user.id)
         sheet_users.update_cell(row, 1, text)
         context.user_data.clear()
-        await update.message.reply_text("✅ Регистрация завершена", reply_markup=MAIN_MENU)
-        return
-
-    if text == "💳 Реквизиты":
-        r = sheet_reqs.get_all_records()[0]
         await update.message.reply_text(
-            f"💳 Реквизиты:\n\n"
-            f"Банк: {r.get('Банк')}\n"
-            f"Получатель: {r.get('Получатель')}\n"
-            f"Счёт: {r.get('Счёт получателя')}\n"
-            f"ИНН: {r.get('ИНН')}",
+            "✅ Регистрация завершена",
             reply_markup=MAIN_MENU,
         )
         return
@@ -115,35 +130,58 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU,
     )
 
-# ---------------- PHOTO ----------------
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- PHOTO / PDF ----------------
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("wait_check"):
+        return
+
     user = update.effective_user
-    photo = update.message.photo[-1]
+    row = find_user_row(user.id)
+
+    fio = ""
+    house = ""
+    phone = ""
+
+    if row:
+        fio = sheet_users.cell(row, 2).value
+        house = sheet_users.cell(row, 1).value
+        phone = sheet_users.cell(row, 4).value
+
+    file_unique_id = (
+        update.message.photo[-1].file_unique_id
+        if update.message.photo
+        else update.message.document.file_unique_id
+    )
 
     sheet_checks.append_row(
         [
             user.id,
             user.username or "",
-            "",
-            "",
-            "",
+            fio,
+            house,
+            phone,
             "",
             "",
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "",
             "",
-            photo.file_unique_id,
+            file_unique_id,
         ]
     )
 
-    await update.message.reply_text("📎 Чек получен ✅", reply_markup=MAIN_MENU)
+    context.user_data.pop("wait_check", None)
+
+    await update.message.reply_text(
+        "✅ Чек получен и сохранён",
+        reply_markup=MAIN_MENU,
+    )
 
 # ---------------- MAIN ----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.run_webhook(
