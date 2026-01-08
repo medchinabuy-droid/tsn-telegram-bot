@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+from datetime import datetime
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -13,31 +15,36 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 import gspread
 from google.oauth2.service_account import Credentials
 
+# -------------------- LOGGING --------------------
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------- ENV ----------
+# -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# ---------- GOOGLE ----------
-creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-creds = Credentials.from_service_account_info(
-    creds_dict,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"],
-)
+ADMIN_IDS = [
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+]
+
+# -------------------- GOOGLE --------------------
+creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
 gc = gspread.authorize(creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
 
+sh = gc.open_by_key(SPREADSHEET_ID)
 sheet_users = sh.worksheet("Лист 1")
 sheet_checks = sh.worksheet("Лист 2")
-sheet_rekv = sh.worksheet("Реквизиты")
+sheet_reqs = sh.worksheet("Реквизиты")
 
-# ---------- UI ----------
-MENU = ReplyKeyboardMarkup(
+# -------------------- KEYBOARD --------------------
+MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📎 Загрузить чек")],
         [KeyboardButton("💳 Реквизиты")],
@@ -45,193 +52,158 @@ MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-PHONE_HINT = "📱 Введите телефон в формате:\n+7XXXXXXXXXX"
-
-# ---------- HELPERS ----------
-def find_user_row(tg_id):
-    col = sheet_users.col_values(3)
-    for i, v in enumerate(col[1:], start=2):
-        if str(v) == str(tg_id):
+# -------------------- HELPERS --------------------
+def find_user_row(telegram_id: int):
+    col = sheet_users.col_values(3)  # Telegram_ID
+    for i, val in enumerate(col, start=1):
+        if val == str(telegram_id):
             return i
     return None
 
 
-def user_data(row):
+def get_user_data(row: int):
     headers = sheet_users.row_values(1)
     values = sheet_users.row_values(row)
     return dict(zip(headers, values))
 
 
-# ---------- START ----------
+def ask_missing_fields(data: dict):
+    if not data.get("ФИО"):
+        return "Введите ФИО:"
+    if not data.get("Телефон"):
+        return "📞 Укажите телефон\nпример: +79261234567"
+    if not data.get("Участок"):
+        return "🏠 Укажите номер дома (участка):"
+    return None
+
+
+# -------------------- HANDLERS --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    row = find_user_row(user.id)
-
-    if not row:
-        context.user_data["step"] = "fio"
-        await update.message.reply_text("👋 Добро пожаловать!\nВведите ФИО:")
-        return
-
-    data = user_data(row)
-
-    if not data.get("Телефон"):
-        context.user_data["step"] = "phone"
-        await update.message.reply_text(PHONE_HINT)
-        return
-
-    if not data.get("Участок"):
-        context.user_data["step"] = "house"
-        await update.message.reply_text("🏠 Укажите номер дома:")
-        return
+    telegram_id = user.id
 
     await update.message.reply_text(
-        "✅ Данные найдены.\n\n"
-        "ℹ️ Внизу есть меню.\n"
-        "Чтобы открыть — нажмите на 📎 рядом с полем ввода 👇",
-        reply_markup=MENU,
+        "👋 Добро пожаловать в ТСН «Искона-Парк»\n\n"
+        "ℹ️ Внизу есть меню с кнопками\n"
+        "📎 Чтобы загрузить чек — нажмите на скрепку\n\n"
+        "⬇️ Выберите действие",
+        reply_markup=MAIN_MENU,
     )
 
+    row = find_user_row(telegram_id)
 
-# ---------- TEXT FLOW ----------
+    if row:
+        data = get_user_data(row)
+        missing = ask_missing_fields(data)
+        if missing:
+            context.user_data["edit_row"] = row
+            await update.message.reply_text(missing)
+        else:
+            await update.message.reply_text(
+                f"Здравствуйте, {data.get('ФИО')} 👋\n"
+                "Выберите действие в меню ⬇️",
+                reply_markup=MAIN_MENU,
+            )
+    else:
+        context.user_data["new_user"] = True
+        await update.message.reply_text("Введите ФИО:")
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
-    step = context.user_data.get("step")
 
-    row = find_user_row(user.id)
-
-    # --- REGISTRATION ---
-    if step == "fio":
-        context.user_data["fio"] = text
-        context.user_data["step"] = "phone"
-        await update.message.reply_text(PHONE_HINT)
-        return
-
-    if step == "phone":
-        context.user_data["phone"] = text
-        context.user_data["step"] = "house"
-        await update.message.reply_text("🏠 Укажите номер дома:")
-        return
-
-    if step == "house":
-        sheet_users.append_row([
-            text,                         # Участок
-            context.user_data["fio"],     # ФИО
-            user.id,                      # Telegram_ID
-            context.user_data["phone"],   # Телефон
-        ])
+    # --- New user ---
+    if context.user_data.get("new_user"):
+        sheet_users.append_row(
+            [
+                "",                 # Участок
+                text,               # ФИО
+                str(user.id),       # Telegram_ID
+                "", "", "", "", "", "", "", "", "", "", ""
+            ]
+        )
         context.user_data.clear()
         await update.message.reply_text(
-            "✅ Регистрация завершена!\n\n"
-            "ℹ️ Внизу меню, нажмите 📎",
-            reply_markup=MENU,
+            "📞 Укажите телефон\nпример: +79261234567"
+        )
+        context.user_data["wait_phone"] = True
+        return
+
+    # --- Phone ---
+    if context.user_data.get("wait_phone"):
+        row = find_user_row(user.id)
+        sheet_users.update_cell(row, 4, text)
+        context.user_data.clear()
+        await update.message.reply_text(
+            "🏠 Укажите номер дома (участка):"
+        )
+        context.user_data["wait_house"] = True
+        return
+
+    # --- House ---
+    if context.user_data.get("wait_house"):
+        row = find_user_row(user.id)
+        sheet_users.update_cell(row, 1, text)
+        context.user_data.clear()
+        await update.message.reply_text(
+            "✅ Данные сохранены.\nСпасибо!",
+            reply_markup=MAIN_MENU,
         )
         return
 
-    # --- EXISTING USER FILL ---
-    if row:
-        data = user_data(row)
-
-        if not data.get("Телефон"):
-            sheet_users.update_cell(row, 4, text)
-            await update.message.reply_text("✅ Телефон сохранён")
-            return
-
-        if not data.get("Участок"):
-            sheet_users.update_cell(row, 1, text)
-            await update.message.reply_text(
-                "✅ Дом сохранён",
-                reply_markup=MENU,
-            )
-            return
-
-    # --- ADMIN ---
-    if user.id in ADMIN_IDS and text.startswith("долг"):
-        parts = text.split()
-        if len(parts) != 2:
-            return
-        house = parts[1]
-        for r in sheet_users.get_all_records():
-            if str(r["Участок"]) == house:
-                await update.message.reply_text(
-                    f"🏠 Дом {house}\n"
-                    f"💰 Сумма: {r.get('Сумма')}\n"
-                    f"📅 Напоминание: {r.get('Дата_напоминания')}\n"
-                    f"📌 Статус: {r.get('Статус')}"
-                )
-                return
+    # --- Menu ---
+    if text == "💳 Реквизиты":
+        reqs = sheet_reqs.get_all_records()[0]
+        await update.message.reply_text(
+            f"💳 Реквизиты:\n\n"
+            f"Банк: {reqs.get('Банк')}\n"
+            f"Получатель: {reqs.get('Получатель')}\n"
+            f"Счёт: {reqs.get('Счёт получателя')}\n"
+            f"ИНН: {reqs.get('ИНН')}",
+        )
 
 
-# ---------- CHECK ----------
-async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    photo = update.message.photo[-1]
+    file_unique_id = photo.file_unique_id
 
-    file = None
-    if msg.photo:
-        file = msg.photo[-1]
-    elif msg.document:
-        file = msg.document
-    else:
-        return
-
-    unique_id = file.file_unique_id
-    if unique_id in sheet_checks.col_values(11):
-        await msg.reply_text("⚠️ Этот чек уже был загружен")
-        return
-
-    row = find_user_row(user.id)
-    data = user_data(row)
-
-    tg_file = await context.bot.get_file(file.file_id)
-
-    sheet_checks.append_row([
-        user.id,
-        user.username,
-        data.get("ФИО"),
-        data.get("Участок"),
-        data.get("Телефон"),
-        tg_file.file_path,
-        "",
-        "",
-        "",
-        "нет",
-        unique_id,
-    ])
-
-    await msg.reply_text("✅ Чек принят")
-
-
-# ---------- REKV ----------
-async def send_rekv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    r = sheet_rekv.get_all_records()[0]
-
-    await update.message.reply_text(
-        f"🏦 Банк: {r['Банк']}\n"
-        f"БИК: {r['БИК']}\n"
-        f"Счёт: {r['Счёт получателя']}\n"
-        f"Получатель: {r['Получатель']}\n"
-        f"ИНН: {r['ИНН']}"
+    sheet_checks.append_row(
+        [
+            user.id,
+            user.username or "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "",
+            "",
+            file_unique_id,
+        ]
     )
 
-    if r.get("QR_оплата"):
-        await update.message.reply_photo(r["QR_оплата"])
+    await update.message.reply_text(
+        "📎 Чек получен и сохранён.\nСпасибо!",
+        reply_markup=MAIN_MENU,
+    )
 
 
-# ---------- MAIN ----------
+# -------------------- APP --------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^📎 Загрузить чек$"), lambda u, c: u.message.reply_text("📎 Нажмите на скрепку и отправьте чек")))
-    app.add_handler(MessageHandler(filters.Regex("^💳 Реквизиты$"), send_rekv))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_check))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
-        webhook_url=os.getenv("RENDER_EXTERNAL_URL"),
+        webhook_url=f"https://tsn-telegram-bot.onrender.com/{WEBHOOK_SECRET}",
+        secret_token=WEBHOOK_SECRET,
     )
 
 
