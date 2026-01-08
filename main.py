@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import logging
 from datetime import datetime
 
@@ -34,9 +35,10 @@ sheet_users = sh.worksheet("Лист 1")
 sheet_checks = sh.worksheet("Лист 2")
 sheet_reqs = sh.worksheet("Реквизиты")
 
-# ---------------- KEYBOARD ----------------
+# ---------------- KEYBOARDS ----------------
 MAIN_MENU = ReplyKeyboardMarkup(
     [
+        [KeyboardButton("🚀 Начать")],
         [KeyboardButton("📎 Загрузить чек")],
         [KeyboardButton("💳 Реквизиты")],
     ],
@@ -45,28 +47,40 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 # ---------------- HELPERS ----------------
 def find_user_row(tg_id: int):
-    ids = sheet_users.col_values(3)  # Telegram_ID
+    ids = sheet_users.col_values(3)
     for i, v in enumerate(ids, start=1):
         if v == str(tg_id):
             return i
     return None
+
+def valid_fio(text: str) -> bool:
+    return len(text.split()) >= 2
+
+def valid_phone(text: str) -> bool:
+    return bool(re.fullmatch(r"\+7\d{10}", text))
+
+def valid_house(text: str) -> bool:
+    return text.isdigit()
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user_id = update.effective_user.id
 
-    await update.message.reply_text(
-        "👋 Добро пожаловать в ТСН «Искона-Парк»",
-        reply_markup=MAIN_MENU,
-    )
-
     row = find_user_row(user_id)
-    if not row:
-        context.user_data["step"] = "fio"
-        await update.message.reply_text("Введите ФИО:")
+
+    if row:
+        fio = sheet_users.cell(row, 2).value
+        await update.message.reply_text(
+            f"👋 Добро пожаловать, {fio}",
+            reply_markup=MAIN_MENU,
+        )
     else:
-        await update.message.reply_text("Вы уже зарегистрированы ✅")
+        context.user_data["step"] = "fio"
+        await update.message.reply_text(
+            "👋 Добро пожаловать в ТСН «Искона-Парк»\n\nВведите ФИО:",
+            reply_markup=MAIN_MENU,
+        )
 
 # ---------------- TEXT ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,16 +88,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     step = context.user_data.get("step")
 
-    # --- КНОПКИ ---
-    if text == "📎 Загрузить чек":
-        await update.message.reply_text(
-            "📎 Пожалуйста, нажмите на скрепку 📎\n"
-            "и отправьте фото или PDF чека",
-            reply_markup=MAIN_MENU,
-        )
-        context.user_data["wait_check"] = True
+    # --- НАЧАТЬ ---
+    if text == "🚀 Начать":
+        await start(update, context)
         return
 
+    # --- РЕКВИЗИТЫ ---
     if text == "💳 Реквизиты":
         rec = sheet_reqs.get_all_records()[0]
         await update.message.reply_text(
@@ -92,30 +102,58 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"БИК: {rec.get('БИК','')}\n"
             f"Получатель: {rec.get('Получатель','')}\n"
             f"Счёт: {rec.get('Счёт получателя','')}\n"
-            f"ИНН: {rec.get('ИНН','')}",
+            f"ИНН: {rec.get('ИНН','')}\n\n"
+            f"🔗 QR оплата:\n{rec.get('QR_оплата','')}",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    # --- ЗАГРУЗКА ЧЕКА ---
+    if text == "📎 Загрузить чек":
+        context.user_data["wait_check"] = True
+        await update.message.reply_text(
+            "📎 Нажмите на скрепку 📎 и отправьте фото или PDF чека",
             reply_markup=MAIN_MENU,
         )
         return
 
     # --- РЕГИСТРАЦИЯ ---
     if step == "fio":
+        if not valid_fio(text):
+            await update.message.reply_text(
+                "❌ Нужно указать минимум Имя и Фамилию\n\nВведите ФИО ещё раз:"
+            )
+            return
+
         sheet_users.append_row(
             ["", text, str(user.id), "", "", "", "", "", "", "", "", "", "", ""]
         )
         context.user_data["step"] = "phone"
         await update.message.reply_text(
-            "📞 Укажите телефон\nпример: +79261234567"
+            "📞 Введите телефон\nпример: +79261234567"
         )
         return
 
     if step == "phone":
+        if not valid_phone(text):
+            await update.message.reply_text(
+                "❌ Телефон должен быть в формате +79261234567\nВведите ещё раз:"
+            )
+            return
+
         row = find_user_row(user.id)
         sheet_users.update_cell(row, 4, text)
         context.user_data["step"] = "house"
-        await update.message.reply_text("🏠 Номер участка:")
+        await update.message.reply_text("🏠 Введите номер участка (только цифры):")
         return
 
     if step == "house":
+        if not valid_house(text):
+            await update.message.reply_text(
+                "❌ Номер участка — только цифры\nВведите ещё раз:"
+            )
+            return
+
         row = find_user_row(user.id)
         sheet_users.update_cell(row, 1, text)
         context.user_data.clear()
@@ -130,7 +168,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU,
     )
 
-# ---------------- PHOTO / PDF ----------------
+# ---------------- FILE ----------------
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
         return
@@ -138,9 +176,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     row = find_user_row(user.id)
 
-    fio = ""
-    house = ""
-    phone = ""
+    fio = house = phone = ""
 
     if row:
         fio = sheet_users.cell(row, 2).value
