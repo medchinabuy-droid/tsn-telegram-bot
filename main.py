@@ -1,164 +1,284 @@
-import os, json, io, re, logging
-from datetime import datetime, timedelta
+import os
+import json
+import logging
+import datetime
+from io import BytesIO
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import Forbidden
-
-import pytesseract
-from PIL import Image
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+# -------------------- НАСТРОЙКИ --------------------
 
-# ---------------- LOG ----------------
-logging.basicConfig(level=logging.INFO)
-
-# ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
-# ---------------- GOOGLE ----------------
-creds = Credentials.from_service_account_info(
-    json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+
+FOLDER_NAME = "TSN_CHECKS"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/cloud-platform",
+]
+
+logging.basicConfig(level=logging.INFO)
+
+# -------------------- GOOGLE INIT --------------------
+
+creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=SCOPES)
+gc = gspread.authorize(creds)
+
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+sheet_users = spreadsheet.worksheet("Лист 1")
+sheet_checks = spreadsheet.worksheet("Лист 2")
+sheet_req = spreadsheet.worksheet("Реквизиты")
+
+drive_service = build("drive", "v3", credentials=creds)
+vision_service = build("vision", "v1", credentials=creds)
+
+# -------------------- UI --------------------
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📎 Загрузить чек"), KeyboardButton("💳 Реквизиты")],
+    ],
+    resize_keyboard=True,
 )
 
-gc = gspread.authorize(creds)
-drive = build("drive", "v3", credentials=creds)
+ADMIN_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📊 Статистика"), KeyboardButton("💰 Долги")],
+    ],
+    resize_keyboard=True,
+)
 
-sh = gc.open_by_key(SPREADSHEET_ID)
-users = sh.worksheet("Пользователи")
-checks = sh.worksheet("Чеки")
+# -------------------- HELPERS --------------------
 
-# ---------------- HELPERS ----------------
-def is_admin(uid): return uid in ADMIN_IDS
+def find_user_row(telegram_id):
+    records = sheet_users.get_all_records()
+    for i, r in enumerate(records, start=2):
+        if str(r.get("Telegram_ID")) == str(telegram_id):
+            return i, r
+    return None, None
 
-def extract_sum_and_date(text):
-    sum_match = re.search(r'(\d+[.,]\d{2})', text.replace(',', '.'))
-    date_match = re.search(r'(\d{2}[./]\d{2}[./]\d{4})', text)
-    return (
-        float(sum_match.group(1)) if sum_match else None,
-        date_match.group(1) if date_match else None
-    )
 
-def upload_drive(data, name):
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg")
-    f = drive.files().create(
-        body={"name": name, "parents": [DRIVE_FOLDER_ID]},
-        media_body=media,
-        fields="id"
+def get_drive_folder_id():
+    q = f"name='{FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder'"
+    res = drive_service.files().list(q=q).execute()
+    if res["files"]:
+        return res["files"][0]["id"]
+
+    folder = drive_service.files().create(
+        body={"name": FOLDER_NAME, "mimeType": "application/vnd.google-apps.folder"}
     ).execute()
-    return f"https://drive.google.com/file/d/{f['id']}"
+    return folder["id"]
 
-def find_user_row(uid):
-    ids = users.col_values(3)
-    for i, v in enumerate(ids, start=1):
-        if v == str(uid):
-            return i
-    return None
 
-# ---------------- FILE HANDLER ----------------
-async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    row = find_user_row(uid)
-    if not row:
-        await update.message.reply_text("❌ Сначала нажмите 🚀 Начать")
+def upload_to_drive(filename, file_bytes):
+    folder_id = get_drive_folder_id()
+    media = MediaIoBaseUpload(file_bytes, resumable=True)
+    file = drive_service.files().create(
+        body={"name": filename, "parents": [folder_id]},
+        media_body=media,
+        fields="id, webViewLink",
+    ).execute()
+    return file["webViewLink"]
+
+
+def is_duplicate(file_unique_id):
+    records = sheet_checks.get_all_records()
+    for r in records:
+        if r.get("File_Unique_ID") == file_unique_id:
+            return True
+    return False
+
+
+def ocr_from_drive_link(link):
+    image = {
+        "source": {"imageUri": link}
+    }
+    response = vision_service.images().annotate(
+        body={
+            "requests": [{
+                "image": image,
+                "features": [{"type": "TEXT_DETECTION"}]
+            }]
+        }
+    ).execute()
+
+    texts = response["responses"][0].get("textAnnotations", [])
+    if not texts:
+        return ""
+
+    return texts[0]["description"]
+
+
+# -------------------- HANDLERS --------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    row, user = find_user_row(tg_id)
+
+    if row:
+        await update.message.reply_text(
+            f"👋 Добро пожаловать, {user.get('ФИО','')}!\n"
+            "Используйте меню ⬇️\n"
+            "📎 — загрузка чека\n"
+            "💳 — реквизиты",
+            reply_markup=MAIN_MENU,
+        )
         return
 
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    data = await file.download_as_bytearray()
+    context.user_data["reg"] = {}
+    await update.message.reply_text("👋 Добро пожаловать в ТСН «Искона-Парк»\n\nВведите ФИО:")
 
-    img = Image.open(io.BytesIO(data))
-    text = pytesseract.image_to_string(img, lang="rus+eng")
 
-    ocr_sum, ocr_date = extract_sum_and_date(text)
-    link = upload_drive(data, f"check_{uid}_{datetime.now().isoformat()}")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    tg_id = update.effective_user.id
 
-    checks.append_row([
-        uid,
-        photo.file_unique_id,
-        link,
-        ocr_sum,
-        ocr_date,
-        "AUTO",
-        datetime.now().strftime("%Y-%m-%d")
-    ])
+    if tg_id in ADMIN_IDS:
+        if text == "📊 Статистика":
+            rows = sheet_checks.get_all_records()
+            await update.message.reply_text(
+                f"📊 Всего чеков: {len(rows)}",
+                reply_markup=ADMIN_MENU,
+            )
+            return
 
-    if ocr_sum:
-        users.update_cell(row, 6, 0)
-        users.update_cell(row, 7, "Оплачено")
-        users.update_cell(row, 8, datetime.now().strftime("%Y-%m-%d"))
+        if text == "💰 Долги":
+            rows = sheet_users.get_all_records()
+            msg = "💰 Долги:\n\n"
+            for r in rows:
+                if r.get("Сумма"):
+                    msg += f"🏠 {r.get('Участок')} — {r.get('ФИО')} — {r.get('Сумма')} ₽\n"
+            await update.message.reply_text(msg or "Нет долгов", reply_markup=ADMIN_MENU)
+            return
 
-    await update.message.reply_text(
-        "✅ Чек принят.\n"
-        "📄 Оплата распознана автоматически.\n"
-        "🔕 Напоминания приостановлены на 30 дней."
-    )
+    if "reg" in context.user_data:
+        reg = context.user_data["reg"]
 
-# ---------------- REMINDERS ----------------
-async def reminders(app: Application):
-    today = datetime.now().date()
-    report = []
+        if "fio" not in reg:
+            reg["fio"] = text
+            await update.message.reply_text(
+                "📞 Введите телефон\n👉 пример: +79261234567"
+            )
+            return
 
-    for i, r in enumerate(users.get_all_records(), start=2):
-        try:
-            debt = float(r["Сумма"])
-            if debt <= 0:
-                continue
+        if "phone" not in reg:
+            reg["phone"] = text
+            await update.message.reply_text("🏠 Номер участка:")
+            return
 
-            last_check = r.get("Дата_последнего_чека")
-            if last_check:
-                if today - datetime.strptime(last_check, "%Y-%m-%d").date() < timedelta(days=30):
-                    continue
+        reg["house"] = text
 
-            due = today + timedelta(days=5)
-            msg = f"💰 Долг {debt} ₽\nОплатите до {due}"
+        sheet_users.append_row([
+            reg["house"],
+            reg["fio"],
+            tg_id,
+            reg["phone"],
+            "", "", "", "", "", "user", "", "", "", ""
+        ])
 
-            try:
-                await app.bot.send_message(int(r["Telegram_ID"]), msg)
-                users.update_cell(i, 9, today.strftime("%Y-%m-%d"))
-                report.append(r["Участок"])
-            except Forbidden:
-                users.update_cell(i, 10, "BLOCKED")
+        context.user_data.pop("reg")
 
-        except Exception:
-            continue
-
-    for admin in ADMIN_IDS:
-        await app.bot.send_message(
-            admin,
-            f"📊 Отчёт:\n"
-            f"Напоминаний: {len(report)}\n"
-            f"Участки: {', '.join(report)}"
+        await update.message.reply_text(
+            "✅ Регистрация завершена\n\n"
+            "ℹ️ Внизу меню ⬇️\n"
+            "📎 Нажмите скрепку для загрузки чека",
+            reply_markup=MAIN_MENU,
         )
 
-# ---------------- MAIN ----------------
+
+async def requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = sheet_req.get_all_records()[0]
+    await update.message.reply_text(
+        "💳 Реквизиты:\n\n"
+        f"Банк: {r.get('Банк')}\n"
+        f"БИК: {r.get('БИК')}\n"
+        f"Счёт: {r.get('Счёт получателя')}\n"
+        f"Получатель: {r.get('Получатель')}\n"
+        f"ИНН: {r.get('ИНН')}\n"
+        f"QR: {r.get('QR_оплата')}",
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document or update.message.photo[-1]
+    file = await doc.get_file()
+
+    if is_duplicate(doc.file_unique_id):
+        await update.message.reply_text("⚠️ Этот чек уже был загружен ранее.")
+        return
+
+    data = BytesIO()
+    await file.download_to_memory(data)
+    data.seek(0)
+
+    link = upload_to_drive(doc.file_unique_id, data)
+
+    ocr_text = ocr_from_drive_link(link)
+
+    sheet_checks.append_row([
+        update.effective_user.id,
+        update.effective_user.username,
+        "",
+        "",
+        "",
+        link,
+        "",
+        datetime.date.today().isoformat(),
+        ocr_text,
+        "NO",
+        doc.file_unique_id,
+        datetime.date.today().isoformat(),
+        "AUTO",
+    ])
+
+    await update.message.reply_text(
+        "✅ Чек принят и сохранён\n"
+        "📄 OCR выполнен\n"
+        "⏸ Напоминания приостановлены на месяц",
+        reply_markup=MAIN_MENU,
+    )
+
+
+# -------------------- MAIN --------------------
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⬇️ Используйте меню")))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_check))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(reminders, "interval", days=1, args=[app])
-    scheduler.start()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.Regex("^💳 Реквизиты$"), requisites))
 
     app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url="https://tsn-telegram-bot.onrender.com"
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=WEBHOOK_URL,
     )
+
 
 if __name__ == "__main__":
     main()
