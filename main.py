@@ -1,17 +1,18 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
 
+from aiohttp import web
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
-from telegram.error import Forbidden
-
-import gspread
-from google.oauth2.service_account import Credentials
 
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO)
@@ -19,38 +20,34 @@ logger = logging.getLogger(__name__)
 
 # ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
-# ---------------- GOOGLE ----------------
-creds = Credentials.from_service_account_info(
-    json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-gc = gspread.authorize(creds)
-
-sh = gc.open_by_key(SPREADSHEET_ID)
-users = sh.worksheet("Лист 1")
-notify_log = sh.worksheet("Лист 3")
-
-# ---------------- CONSTANT TEXT ----------------
-BATTLE_NOTIFICATION_TEXT = (
-    "⚠️ ВАЖНОЕ УВЕДОМЛЕНИЕ ТСН «ИСКОНА-ПАРК»\n\n"
-    "Пожалуйста, проверьте состояние оплат.\n"
-    "При необходимости загрузите чек через меню бота.\n\n"
-    "Спасибо за оперативную реакцию."
-)
+WEBHOOK_PATH = "/webhook"
+PORT = int(os.getenv("PORT", 10000))
+BASE_URL = "https://tsn-telegram-bot.onrender.com"
 
 # ---------------- MENUS ----------------
+USER_MENU = ReplyKeyboardMarkup(
+    [
+        ["🚀 Начать"],
+        ["📎 Загрузить чек", "💳 Реквизиты"]
+    ],
+    resize_keyboard=True
+)
+
 ADMIN_MENU = ReplyKeyboardMarkup(
-    [["🚀 Начать"], ["🛠 Админ-панель"]],
+    [
+        ["🚀 Начать"],
+        ["🛠 Админ-панель"],
+        ["📎 Загрузить чек", "💳 Реквизиты"]
+    ],
     resize_keyboard=True
 )
 
 ADMIN_PANEL = ReplyKeyboardMarkup(
     [
         ["📣 Боевое уведомление"],
-        ["🚀 Запустить рассылку"],
+        ["🔍 Долг по участку"],
         ["📊 Статистика"],
         ["⬅️ Назад"]
     ],
@@ -58,104 +55,100 @@ ADMIN_PANEL = ReplyKeyboardMarkup(
 )
 
 # ---------------- HELPERS ----------------
-def is_admin(uid): 
+def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-def log_notification(user_row, notif_type, status):
-    notify_log.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        user_row.get("Telegram_ID"),
-        user_row.get("username", ""),
-        user_row.get("Участок"),
-        user_row.get("Сумма", ""),
-        notif_type,
-        status
-    ])
-
-def mark_blocked(row_idx):
-    col = users.find("Заблокирован").col
-    users.update_cell(row_idx, col, "TRUE")
-
-# ---------------- START ----------------
+# ---------------- HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "🛠 Вы администратор",
-            reply_markup=ADMIN_MENU
-        )
-    else:
-        await update.message.reply_text("ℹ️ Используйте меню")
+    uid = update.effective_user.id
+    menu = ADMIN_MENU if is_admin(uid) else USER_MENU
 
-# ---------------- HANDLER ----------------
+    await update.message.reply_text(
+        "👋 Бот ТСН «Искона-Парк» работает\n\n⬇️ Используйте меню ниже",
+        reply_markup=menu
+    )
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = update.message.text
     uid = update.effective_user.id
 
-    # --- START ---
+    # START
     if text == "🚀 Начать":
         await start(update, context)
         return
 
-    # --- ADMIN PANEL ---
+    # ADMIN PANEL
     if text == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text("Админ-панель:", reply_markup=ADMIN_PANEL)
-        return
-
-    # --- BATTLE NOTIFICATION ---
-    if text == "📣 Боевое уведомление" and is_admin(uid):
-        context.user_data["await_plot"] = True
-        await update.message.reply_text("Введите номер участка:")
-        return
-
-    if context.user_data.get("await_plot") and is_admin(uid):
-        context.user_data.pop("await_plot")
-        plot = text
-
-        records = users.get_all_records()
-        for idx, row in enumerate(records, start=2):
-            if str(row.get("Участок")) == plot:
-                try:
-                    await update.get_bot().send_message(
-                        chat_id=int(row["Telegram_ID"]),
-                        text=BATTLE_NOTIFICATION_TEXT
-                    )
-                    log_notification(row, "боевое", "доставлено")
-                    await update.message.reply_text(
-                        f"✅ Уведомление отправлено участку {plot}",
-                        reply_markup=ADMIN_PANEL
-                    )
-                except Forbidden:
-                    mark_blocked(idx)
-                    log_notification(row, "боевое", "заблокирован")
-                    await update.message.reply_text(
-                        f"⛔ Пользователь участка {plot} заблокировал бота",
-                        reply_markup=ADMIN_PANEL
-                    )
-                return
-
         await update.message.reply_text(
-            "❌ Участок не найден",
+            "🛠 Админ-панель\nВыберите действие:",
             reply_markup=ADMIN_PANEL
         )
         return
 
-    # --- BACK ---
     if text == "⬅️ Назад":
-        await update.message.reply_text("⬇️ Главное меню", reply_markup=ADMIN_MENU)
+        await update.message.reply_text(
+            "⬇️ Возврат в меню",
+            reply_markup=ADMIN_MENU
+        )
         return
+
+    # TEST BATTLE NOTIFY
+    if text == "📣 Боевое уведомление" and is_admin(uid):
+        context.user_data["battle_wait"] = True
+        await update.message.reply_text(
+            "🏠 Введите номер участка для боевого уведомления:"
+        )
+        return
+
+    if context.user_data.get("battle_wait") and is_admin(uid):
+        context.user_data.pop("battle_wait")
+
+        house = text.strip()
+        # ⚠️ пока тест: отправляем админу
+        await update.message.reply_text(
+            f"📣 Боевое уведомление отправлено\n"
+            f"Участок: {house}\n\n"
+            f"(пока тест — реальная рассылка будет дальше)"
+        )
+        logger.info(f"BATTLE_NOTIFY house={house} by admin={uid}")
+        return
+
+    await update.message.reply_text("ℹ️ Используйте кнопки меню ⬇️")
+
+# ---------------- APP INIT ----------------
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+# ---------------- AIOHTTP WEBHOOK ----------------
+async def handle_webhook(request: web.Request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return web.Response(text="ok")
+    except Exception as e:
+        logger.exception("Webhook error")
+        return web.Response(status=500, text="error")
+
+async def on_startup(app):
+    await application.initialize()
+    await application.bot.set_webhook(f"{BASE_URL}{WEBHOOK_PATH}")
+    await application.start()
+    logger.info("Webhook set & bot started")
+
+async def on_shutdown(app):
+    await application.stop()
+    await application.shutdown()
 
 # ---------------- MAIN ----------------
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url="https://tsn-telegram-bot.onrender.com"
-    )
+    web.run_app(app, port=PORT)
 
 if __name__ == "__main__":
     main()
