@@ -37,7 +37,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 ADMIN_IDS = {6810194645}
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
+SHEET_NAME = os.getenv("SHEET_NAME", "Лист 1")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
 # ================== ЛОГИ ==================
