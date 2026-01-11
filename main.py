@@ -2,7 +2,6 @@ import os
 import json
 import logging
 from datetime import datetime
-import io
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -13,8 +12,6 @@ from telegram.error import Forbidden
 
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO)
@@ -23,24 +20,26 @@ logger = logging.getLogger(__name__)
 # ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
 # ---------------- GOOGLE ----------------
 creds = Credentials.from_service_account_info(
     json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
 gc = gspread.authorize(creds)
-drive = build("drive", "v3", credentials=creds)
 
 sh = gc.open_by_key(SPREADSHEET_ID)
 users = sh.worksheet("Лист 1")
-checks = sh.worksheet("Лист 2")
 notify_log = sh.worksheet("Лист 3")
+
+# ---------------- CONSTANT TEXT ----------------
+BATTLE_NOTIFICATION_TEXT = (
+    "⚠️ ВАЖНОЕ УВЕДОМЛЕНИЕ ТСН «ИСКОНА-ПАРК»\n\n"
+    "Пожалуйста, проверьте состояние оплат.\n"
+    "При необходимости загрузите чек через меню бота.\n\n"
+    "Спасибо за оперативную реакцию."
+)
 
 # ---------------- MENUS ----------------
 ADMIN_MENU = ReplyKeyboardMarkup(
@@ -59,21 +58,23 @@ ADMIN_PANEL = ReplyKeyboardMarkup(
 )
 
 # ---------------- HELPERS ----------------
-def is_admin(uid): return uid in ADMIN_IDS
+def is_admin(uid): 
+    return uid in ADMIN_IDS
 
-def log_notification(row, user, amount, notif_type, status):
+def log_notification(user_row, notif_type, status):
     notify_log.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        user["id"],
-        user.get("username", ""),
-        row["Участок"],
-        amount,
+        user_row.get("Telegram_ID"),
+        user_row.get("username", ""),
+        user_row.get("Участок"),
+        user_row.get("Сумма", ""),
         notif_type,
         status
     ])
 
 def mark_blocked(row_idx):
-    users.update_cell(row_idx, users.find("Заблокирован").col, "TRUE")
+    col = users.find("Заблокирован").col
+    users.update_cell(row_idx, col, "TRUE")
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,99 +86,62 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("ℹ️ Используйте меню")
 
-# ---------------- ADMIN ACTIONS ----------------
+# ---------------- HANDLER ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text.strip()
     uid = update.effective_user.id
 
+    # --- START ---
     if text == "🚀 Начать":
         await start(update, context)
         return
 
+    # --- ADMIN PANEL ---
     if text == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text(
-            "Админ-панель:",
-            reply_markup=ADMIN_PANEL
-        )
+        await update.message.reply_text("Админ-панель:", reply_markup=ADMIN_PANEL)
         return
 
-    # ---- БОЕВОЕ УВЕДОМЛЕНИЕ ----
+    # --- BATTLE NOTIFICATION ---
     if text == "📣 Боевое уведомление" and is_admin(uid):
-        context.user_data["broadcast"] = True
-        await update.message.reply_text("Введите текст уведомления:")
+        context.user_data["await_plot"] = True
+        await update.message.reply_text("Введите номер участка:")
         return
 
-    if context.user_data.get("broadcast") and is_admin(uid):
-        msg = text
-        context.user_data.pop("broadcast")
+    if context.user_data.get("await_plot") and is_admin(uid):
+        context.user_data.pop("await_plot")
+        plot = text
 
-        sent = blocked = 0
-        for i, r in enumerate(users.get_all_records(), start=2):
-            try:
-                await update.get_bot().send_message(
-                    chat_id=int(r["Telegram_ID"]),
-                    text=msg
-                )
-                sent += 1
-                log_notification(r, update.effective_user, "", "ручное", "доставлено")
-            except Forbidden:
-                blocked += 1
-                mark_blocked(i)
-                log_notification(r, update.effective_user, "", "ручное", "заблокирован")
-
-        await update.message.reply_text(
-            f"✅ Рассылка завершена\n"
-            f"📨 Отправлено: {sent}\n"
-            f"⛔ Заблокировали: {blocked}",
-            reply_markup=ADMIN_PANEL
-        )
-        return
-
-    # ---- АВТО РАССЫЛКА ДОЛГОВ ----
-    if text == "🚀 Запустить рассылку" and is_admin(uid):
-        sent = blocked = 0
-        for i, r in enumerate(users.get_all_records(), start=2):
-            if r.get("Сумма", 0) and int(r["Сумма"]) > 0:
+        records = users.get_all_records()
+        for idx, row in enumerate(records, start=2):
+            if str(row.get("Участок")) == plot:
                 try:
                     await update.get_bot().send_message(
-                        chat_id=int(r["Telegram_ID"]),
-                        text=f"⚠️ У вас задолженность {r['Сумма']} ₽"
+                        chat_id=int(row["Telegram_ID"]),
+                        text=BATTLE_NOTIFICATION_TEXT
                     )
-                    sent += 1
-                    log_notification(r, update.effective_user, r["Сумма"], "долг", "доставлено")
+                    log_notification(row, "боевое", "доставлено")
+                    await update.message.reply_text(
+                        f"✅ Уведомление отправлено участку {plot}",
+                        reply_markup=ADMIN_PANEL
+                    )
                 except Forbidden:
-                    blocked += 1
-                    mark_blocked(i)
-                    log_notification(r, update.effective_user, r["Сумма"], "долг", "заблокирован")
+                    mark_blocked(idx)
+                    log_notification(row, "боевое", "заблокирован")
+                    await update.message.reply_text(
+                        f"⛔ Пользователь участка {plot} заблокировал бота",
+                        reply_markup=ADMIN_PANEL
+                    )
+                return
 
         await update.message.reply_text(
-            f"🚀 Рассылка долгов завершена\n"
-            f"📨 Отправлено: {sent}\n"
-            f"⛔ Заблокировали: {blocked}",
+            "❌ Участок не найден",
             reply_markup=ADMIN_PANEL
         )
         return
 
-    # ---- СТАТИСТИКА ----
-    if text == "📊 Статистика" and is_admin(uid):
-        total = len(users.get_all_records())
-        blocked = sum(1 for r in users.get_all_records() if r.get("Заблокирован") == "TRUE")
-        notifs = len(notify_log.get_all_records())
-
-        await update.message.reply_text(
-            f"📊 Статистика бота\n\n"
-            f"👥 Пользователей: {total}\n"
-            f"⛔ Заблокировали: {blocked}\n"
-            f"📨 Уведомлений отправлено: {notifs}",
-            reply_markup=ADMIN_PANEL
-        )
-        return
-
+    # --- BACK ---
     if text == "⬅️ Назад":
-        await update.message.reply_text(
-            "⬇️ Главное меню",
-            reply_markup=ADMIN_MENU
-        )
+        await update.message.reply_text("⬇️ Главное меню", reply_markup=ADMIN_MENU)
         return
 
 # ---------------- MAIN ----------------
