@@ -7,151 +7,172 @@ from aiohttp import web
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    KeyboardButton,
+    KeyboardButton
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters,
+    filters
 )
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# =======================
-# ENV
-# =======================
+# -------------------- CONFIG --------------------
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# =======================
-# LOGGING
-# =======================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# -------------------- LOGGING --------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =======================
-# GOOGLE SHEETS
-# =======================
-creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-gc = gspread.authorize(credentials)
-sh = gc.open_by_key(SPREADSHEET_ID)
+# -------------------- GOOGLE SHEETS --------------------
 
-def ws_by_index(i: int, name: str):
-    ws = sh.get_worksheet(i)
-    logger.info(f"WS OK index={i} title='{ws.title}' expected='{name}'")
-    return ws
+creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+gc = gspread.authorize(creds)
 
-sheet_main = ws_by_index(0, "Лист 1")
-sheet_new = ws_by_index(1, "Лист 2")
-sheet_logs = ws_by_index(2, "Лист 3")
-sheet_rekv = ws_by_index(3, "Реквизиты")
+sh = gc.open_by_key(os.getenv("SPREADSHEET_ID"))
 
-# =======================
-# UTILS
-# =======================
-def log_event(event: str, user_id=None, extra=""):
+sheet_users = sh.get_worksheet(0)   # Лист 1
+sheet_debts = sh.get_worksheet(1)   # Лист 2
+sheet_logs = sh.get_worksheet(2)    # Лист 3
+sheet_reqs = sh.get_worksheet(3)    # Реквизиты
+
+# -------------------- KEYBOARDS --------------------
+
+USER_KB = ReplyKeyboardMarkup(
+    [
+        ["🔍 Долг по участку"],
+        ["📎 Загрузить чек"],
+        ["💳 Реквизиты"]
+    ],
+    resize_keyboard=True
+)
+
+ADMIN_KB = ReplyKeyboardMarkup(
+    [
+        ["📣 Боевое уведомление"],
+        ["📊 Статистика"],
+        ["⬅️ Назад"]
+    ],
+    resize_keyboard=True
+)
+
+# -------------------- HELPERS --------------------
+
+def log_event(event, user_id="", details=""):
     sheet_logs.append_row([
-        datetime.now().isoformat(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         event,
-        str(user_id) if user_id else "",
-        extra
+        user_id,
+        details
     ])
 
-def main_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["📎 Загрузить чек"],
-            ["💳 Реквизиты"],
-        ],
-        resize_keyboard=True
-    )
+def get_all_users():
+    return sheet_users.col_values(1)[1:]
 
-# =======================
-# HANDLERS
-# =======================
+# -------------------- HANDLERS --------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    log_event("START", user.id, user.username or "")
-    await update.message.reply_text(
-        "👋 Добро пожаловать в ТСН «Искона-Парк»\n\n"
-        "ℹ️ Используйте меню ⬇️",
-        reply_markup=main_menu()
-    )
+    users = get_all_users()
+
+    if str(user.id) not in users:
+        sheet_users.append_row([user.id, user.username or "", datetime.now().isoformat()])
+        log_event("REGISTER", user.id)
+
+    kb = ADMIN_KB if user.id in ADMIN_IDS else USER_KB
+    await update.message.reply_text("Главное меню", reply_markup=kb)
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    user = update.effective_user
+    user_id = update.effective_user.id
 
-    if text == "💳 Реквизиты":
-        rows = sheet_rekv.get_all_records()
-        if rows:
-            r = rows[0]
-            msg = (
-                "💳 Реквизиты:\n\n"
-                f"Банк: {r.get('Банк')}\n"
-                f"БИК: {r.get('БИК')}\n"
-                f"Счёт: {r.get('Счёт получателя')}\n"
-                f"Получатель: {r.get('Получатель')}\n"
-                f"ИНН: {r.get('ИНН')}"
+    # -------- ADMIN --------
+    if user_id in ADMIN_IDS:
+
+        if text == "📣 Боевое уведомление":
+            sent = 0
+            blocked = 0
+            message = (
+                "⚠️ ВАЖНОЕ УВЕДОМЛЕНИЕ\n\n"
+                "Просим срочно проверить задолженность и оплатить."
             )
-        else:
-            msg = "❌ Реквизиты не найдены"
-        await update.message.reply_text(msg)
-        log_event("REKV", user.id)
-        return
 
-    if text == "📎 Загрузить чек":
-        await update.message.reply_text(
-            "📎 Отправьте фото или PDF чека",
-            reply_markup=main_menu()
-        )
-        log_event("UPLOAD_PROMPT", user.id)
-        return
+            for uid in get_all_users():
+                try:
+                    await context.bot.send_message(chat_id=int(uid), text=message)
+                    sent += 1
+                except:
+                    blocked += 1
+                    log_event("BLOCKED", uid)
 
-    await update.message.reply_text(
-        "ℹ️ Используйте кнопки меню ⬇️",
-        reply_markup=main_menu()
-    )
+            log_event("BROADCAST", user_id, f"sent={sent}, blocked={blocked}")
+            await update.message.reply_text(
+                f"Рассылка завершена\n\nОтправлено: {sent}\nЗаблокировали: {blocked}"
+            )
+            return
 
-# =======================
-# WEBHOOK APP
-# =======================
+        if text == "📊 Статистика":
+            users = len(get_all_users())
+            logs = sheet_logs.get_all_values()[1:]
+            broadcasts = len([l for l in logs if l[1] == "BROADCAST"])
+            blocked = len([l for l in logs if l[1] == "BLOCKED"])
+
+            await update.message.reply_text(
+                f"📊 Статистика\n\n"
+                f"Пользователей: {users}\n"
+                f"Рассылок: {broadcasts}\n"
+                f"Блокировок: {blocked}"
+            )
+            return
+
+        if text == "⬅️ Назад":
+            await update.message.reply_text("Главное меню", reply_markup=USER_KB)
+            return
+
+    # -------- USER --------
+    await update.message.reply_text("Используйте меню 👇")
+
+# -------------------- WEBHOOK --------------------
+
 async def handle_webhook(request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return web.Response(status=403)
-
     data = await request.json()
     await application.update_queue.put(Update.de_json(data, application.bot))
-    return web.Response(text="OK")
+    return web.Response(text="ok")
 
-async def on_startup(app):
-    await application.bot.set_webhook(
-        url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET
-    )
-    logger.info("Webhook set")
+# -------------------- APP INIT --------------------
 
-# =======================
-# MAIN
-# =======================
 application = Application.builder().token(BOT_TOKEN).build()
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-aio_app = web.Application()
-aio_app.router.add_post("/", handle_webhook)
-aio_app.on_startup.append(on_startup)
+async def on_startup(app):
+    await application.initialize()
+    await application.bot.set_webhook(WEBHOOK_URL)
+    await application.start()
+    logger.info("BOT STARTED")
+
+async def on_shutdown(app):
+    await application.stop()
+    await application.shutdown()
+
+app = web.Application()
+app.router.add_post("/", handle_webhook)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    logger.info("BOT START")
-    web.run_app(aio_app, port=int(os.getenv("PORT", 8080)))
+    web.run_app(app, port=int(os.getenv("PORT", 8080)))
