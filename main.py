@@ -2,7 +2,7 @@ import os
 import json
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import pytz
 
@@ -52,7 +52,7 @@ sheet_reqs = sh.worksheet("Реквизиты")
 # ---------------- TEXTS ----------------
 REMINDER_TEXT = (
     "⏰ Напоминание ТСН\n\n"
-    "У вас есть задолженность по взносам.\n"
+    "У вас есть задолженность.\n"
     "Просим произвести оплату.\n\n"
     "После оплаты загрузите чек в бота."
 )
@@ -85,7 +85,7 @@ ADMIN_PANEL = ReplyKeyboardMarkup(
 )
 
 # ---------------- HELPERS ----------------
-def is_admin(uid): 
+def is_admin(uid):
     return uid in ADMIN_IDS
 
 def log_stat(event, uid="", username="", house="", comment=""):
@@ -115,8 +115,8 @@ def upload_to_drive(data, name, mime):
 
 # ---------------- AUTO REMINDERS ----------------
 async def auto_reminders(app: Application):
-    logger.info("AUTO REMINDERS STARTED")
     rows = sheet_users.get_all_records()
+    today = datetime.now(TZ).date()
 
     for r in rows:
         try:
@@ -127,41 +127,30 @@ async def auto_reminders(app: Application):
             if r.get("Статус", "").upper() == "ОПЛАЧЕНО":
                 continue
 
-            chat_id = int(r.get("TelegramID"))
+            pause_date = r.get("Дата_напоминания")
+            if pause_date:
+                if today < datetime.strptime(pause_date, "%Y-%m-%d").date():
+                    continue
+
+            chat_id = int(r["TelegramID"])
             await app.bot.send_message(chat_id, REMINDER_TEXT)
 
-            log_stat(
-                "авто_напоминание",
-                chat_id,
-                "",
-                r.get("Участок"),
-                f"долг {debt}"
-            )
+            log_stat("авто_напоминание", chat_id, "", r.get("Участок"))
 
         except Exception as e:
-            log_stat(
-                "blocked",
-                r.get("TelegramID"),
-                "",
-                r.get("Участок"),
-                str(e)
-            )
+            log_stat("blocked", r.get("TelegramID"), "", r.get("Участок"), str(e))
+            for admin in ADMIN_IDS:
+                await app.bot.send_message(
+                    admin,
+                    f"🚫 Блокировка\nУчасток: {r.get('Участок')}\nID: {r.get('TelegramID')}\n{e}"
+                )
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     context.user_data.clear()
-
     menu = ADMIN_MENU if is_admin(uid) else USER_MENU
-    log_stat("start", uid, update.effective_user.username)
-
-    row = find_user_row(uid)
-    if row:
-        fio = sheet_users.cell(row, 2).value
-        await update.message.reply_text(f"👋 {fio}", reply_markup=menu)
-    else:
-        context.user_data["step"] = "fio"
-        await update.message.reply_text("Введите ФИО:", reply_markup=menu)
+    await update.message.reply_text("👋 Добро пожаловать", reply_markup=menu)
 
 # ---------------- TEXT ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,23 +165,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Админ-меню", reply_markup=ADMIN_PANEL)
         return
 
-    if text == "⬅️ Назад":
-        await update.message.reply_text("Главное меню", reply_markup=ADMIN_MENU)
-        return
-
-    # -------- BATTLE --------
     if text == "📣 Боевое уведомление" and is_admin(uid):
-        context.user_data["wait_battle"] = True
-        await update.message.reply_text("Участок / ALL / SELF:")
+        context.user_data["battle"] = True
+        await update.message.reply_text("Участок / ALL / SELF")
         return
 
-    if context.user_data.get("wait_battle") and is_admin(uid):
-        context.user_data.pop("wait_battle")
-
+    if context.user_data.get("battle"):
+        context.user_data.clear()
         if text == "SELF":
             await context.bot.send_message(uid, BATTLE_TEXT)
-            await update.message.reply_text("✅ Отправлено вам", reply_markup=ADMIN_PANEL)
-            return
+            return await update.message.reply_text("Отправлено себе")
 
         sent = 0
         for r in sheet_users.get_all_records():
@@ -202,8 +184,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent += 1
                 except:
                     pass
+        await update.message.reply_text(f"Отправлено: {sent}")
 
-        await update.message.reply_text(f"✅ Отправлено: {sent}", reply_markup=ADMIN_PANEL)
+    if text == "📎 Загрузить чек":
+        context.user_data["wait_check"] = True
+        await update.message.reply_text("Отправьте чек")
         return
 
 # ---------------- FILE ----------------
@@ -212,17 +197,26 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file = update.message.photo[-1] if update.message.photo else update.message.document
-
     if is_duplicate(file.file_unique_id):
-        await update.message.reply_text("❌ Чек уже загружен")
+        await update.message.reply_text("❌ Чек уже был")
         return
 
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
     upload_to_drive(data, "check", file.mime_type)
 
-    context.user_data.pop("wait_check")
-    await update.message.reply_text("✅ Чек принят", reply_markup=USER_MENU)
+    uid = update.effective_user.id
+    row = find_user_row(uid)
+
+    if row:
+        sheet_users.update_cell(row, 5, "0")
+        sheet_users.update_cell(row, 6, "ОПЛАЧЕНО")
+        pause = (datetime.now(TZ) + timedelta(days=30)).strftime("%Y-%m-%d")
+        sheet_users.update_cell(row, 7, pause)
+
+    log_stat("авто_закрытие_долга", uid)
+    context.user_data.clear()
+    await update.message.reply_text("✅ Чек принят, долг закрыт", reply_markup=USER_MENU)
 
 # ---------------- MAIN ----------------
 def main():
