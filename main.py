@@ -43,53 +43,38 @@ sheet_checks = sh.worksheet("Лист 2")
 sheet_stats = sh.worksheet("Лист 3")
 sheet_reqs = sh.worksheet("Реквизиты")
 
-# ---------------- CONSTANTS ----------------
+# ---------------- TEXTS ----------------
 BATTLE_TEXT = (
-    "⚠️ Уважаемый собственник!\n\n"
-    "Зафиксирована задолженность по взносам ТСН.\n"
+    "⚠️ Уведомление ТСН\n\n"
+    "У вас имеется задолженность по взносам.\n"
     "Просим срочно погасить долг.\n\n"
     "Если оплата произведена — загрузите чек в бота."
 )
 
 # ---------------- MENUS ----------------
 USER_MENU = ReplyKeyboardMarkup(
-    [
-        ["🚀 Начать"],
-        ["📎 Загрузить чек", "💳 Реквизиты"]
-    ],
+    [["🚀 Начать"], ["📎 Загрузить чек", "💳 Реквизиты"]],
     resize_keyboard=True
 )
 
 ADMIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["🚀 Начать"],
-        ["🛠 Админ-панель"],
-        ["📎 Загрузить чек", "💳 Реквизиты"]
-    ],
+    [["🚀 Начать"], ["🛠 Админ-панель"], ["📎 Загрузить чек", "💳 Реквизиты"]],
     resize_keyboard=True
 )
 
 ADMIN_PANEL = ReplyKeyboardMarkup(
-    [
-        ["🔍 Долг по участку"],
-        ["📣 Боевое уведомление"],
-        ["📊 Статистика"],
-        ["⬅️ Назад"]
-    ],
+    [["🔍 Долг по участку"], ["📣 Боевое уведомление"], ["📊 Статистика"], ["⬅️ Назад"]],
     resize_keyboard=True
 )
 
 # ---------------- HELPERS ----------------
-def is_admin(uid): return uid in ADMIN_IDS
+def is_admin(uid): 
+    return uid in ADMIN_IDS
 
 def log_stat(event, uid="", username="", house="", comment=""):
     sheet_stats.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        event,
-        uid,
-        username,
-        house,
-        comment
+        event, uid, username, house, comment
     ])
 
 def find_user_row(uid):
@@ -127,44 +112,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if row:
         fio = sheet_users.cell(row, 2).value
-        await update.message.reply_text(
-            f"👋 С возвращением, {fio}",
-            reply_markup=menu
-        )
+        await update.message.reply_text(f"👋 С возвращением, {fio}", reply_markup=menu)
     else:
         context.user_data["step"] = "fio"
-        await update.message.reply_text(
-            "👋 Добро пожаловать!\nВведите ФИО:",
-            reply_markup=menu
-        )
+        await update.message.reply_text("Введите ФИО:", reply_markup=menu)
 
-# ---------------- TEXT HANDLER ----------------
+# ---------------- TEXT ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     uid = update.effective_user.id
     username = update.effective_user.username or ""
-
-    logger.info(f"{uid}: {text}")
 
     if text == "🚀 Начать":
         await start(update, context)
         return
 
     if text == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text(
-            "🛠 Админ-панель",
-            reply_markup=ADMIN_PANEL
-        )
+        await update.message.reply_text("Админ-меню", reply_markup=ADMIN_PANEL)
         return
 
     if text == "⬅️ Назад":
-        await update.message.reply_text(
-            "Главное меню",
-            reply_markup=ADMIN_MENU
-        )
+        await update.message.reply_text("Главное меню", reply_markup=ADMIN_MENU)
         return
 
-    # --------- ADMIN: DEBT ---------
+    # ---- ДОЛГ ----
     if text == "🔍 Долг по участку" and is_admin(uid):
         context.user_data["wait_debt"] = True
         await update.message.reply_text("Введите номер участка:")
@@ -172,103 +143,66 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("wait_debt") and is_admin(uid):
         context.user_data.pop("wait_debt")
-        for r in sheet_checks.get_all_records():
+        for r in sheet_users.get_all_records():
             if str(r.get("Участок")) == text:
                 await update.message.reply_text(
                     f"🏠 Участок {text}\n"
                     f"ФИО: {r.get('ФИО')}\n"
+                    f"Телефон: {r.get('Телефон')}\n"
                     f"Долг: {r.get('Сумма')}\n"
                     f"Статус: {r.get('Статус')}",
                     reply_markup=ADMIN_PANEL
                 )
-                log_stat("долг_просмотр", uid, username, text)
                 return
-        await update.message.reply_text("❌ Не найдено", reply_markup=ADMIN_PANEL)
+        await update.message.reply_text("❌ Участок не найден", reply_markup=ADMIN_PANEL)
         return
 
-    # --------- ADMIN: BATTLE ---------
+    # ---- БОЕВОЕ ----
     if text == "📣 Боевое уведомление" and is_admin(uid):
         context.user_data["wait_battle"] = True
-        await update.message.reply_text(
-            "Введите номер участка или ALL:"
-        )
+        await update.message.reply_text("Введите участок или ALL:")
         return
 
     if context.user_data.get("wait_battle") and is_admin(uid):
         context.user_data.pop("wait_battle")
-        count = 0
+        sent = 0
         for r in sheet_users.get_all_records():
             if text == "ALL" or str(r.get("Участок")) == text:
                 try:
-                    await context.bot.send_message(
-                        chat_id=int(r.get("TelegramID")),
-                        text=BATTLE_TEXT
-                    )
-                    count += 1
-                except:
-                    pass
-        log_stat("боевое_уведомление", uid, username, text, f"отправлено: {count}")
-        await update.message.reply_text(
-            f"✅ Отправлено: {count}",
-            reply_markup=ADMIN_PANEL
-        )
+                    await context.bot.send_message(int(r["TelegramID"]), BATTLE_TEXT)
+                    sent += 1
+                except Exception as e:
+                    logger.error(e)
+        await update.message.reply_text(f"✅ Отправлено: {sent}", reply_markup=ADMIN_PANEL)
         return
 
-    # --------- STATS ---------
+    # ---- СТАТИСТИКА ----
     if text == "📊 Статистика" and is_admin(uid):
-        total = len(sheet_stats.get_all_values()) - 1
+        rows = sheet_stats.get_all_records()
         await update.message.reply_text(
-            f"📊 Всего событий: {total}",
+            f"📊 Всего событий: {len(rows)}\n"
+            f"Регистраций: {sum(1 for r in rows if r['event']=='регистрация')}\n"
+            f"Чеков: {sum(1 for r in rows if r['event']=='загрузка_чека')}",
             reply_markup=ADMIN_PANEL
         )
         return
 
-    # --------- REQS ---------
+    # ---- РЕКВИЗИТЫ ----
     if text == "💳 Реквизиты":
         r = sheet_reqs.row_values(2)
         await update.message.reply_text(
-            f"Банк: {r[0]}\nБИК: {r[1]}\nСчёт: {r[2]}",
+            f"🏦 Банк: {r[0]}\nБИК: {r[1]}\nСчёт: {r[2]}\n"
+            f"Получатель: {r[3]}\nИНН: {r[4]}\nQR: {r[5]}",
             reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
         )
         return
 
-    # --------- CHECK ---------
     if text == "📎 Загрузить чек":
         context.user_data["wait_check"] = True
-        await update.message.reply_text("Отправьте фото или PDF чека")
+        await update.message.reply_text("Пришлите фото или PDF чека")
         return
 
-    # --------- REG ---------
-    step = context.user_data.get("step")
-
-    if step == "fio":
-        if not valid_fio(text):
-            await update.message.reply_text("Введите корректное ФИО")
-            return
-        sheet_users.append_row(["", text, str(uid)])
-        context.user_data["step"] = "phone"
-        return await update.message.reply_text("Телефон +7XXXXXXXXXX")
-
-    if step == "phone":
-        if not valid_phone(text):
-            await update.message.reply_text("Формат +7XXXXXXXXXX")
-            return
-        row = find_user_row(uid)
-        sheet_users.update_cell(row, 4, text)
-        context.user_data["step"] = "house"
-        return await update.message.reply_text("Номер участка")
-
-    if step == "house":
-        row = find_user_row(uid)
-        sheet_users.update_cell(row, 1, text)
-        context.user_data.clear()
-        log_stat("регистрация", uid, username, text)
-        return await update.message.reply_text(
-            "✅ Регистрация завершена",
-            reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
-        )
-
-# ---------------- FILE HANDLER ----------------
+# ---------------- FILE ----------------
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
         return
@@ -276,12 +210,11 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = update.message.photo[-1] if update.message.photo else update.message.document
 
     if is_duplicate(file.file_unique_id):
-        await update.message.reply_text("❌ Чек уже загружен")
+        await update.message.reply_text("❌ Этот чек уже был загружен")
         return
 
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
-
     link = upload_to_drive(data, "check", file.mime_type)
 
     uid = update.effective_user.id
@@ -300,12 +233,14 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_stat("загрузка_чека", uid, update.effective_user.username, house)
 
     context.user_data.pop("wait_check")
-    await update.message.reply_text("✅ Чек сохранён", reply_markup=USER_MENU)
+    await update.message.reply_text(
+        "✅ Чек сохранён\nЕсли у вас был долг — он будет проверен",
+        reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
+    )
 
 # ---------------- MAIN ----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
