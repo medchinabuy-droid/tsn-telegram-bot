@@ -623,6 +623,309 @@ def main():
         port=int(os.getenv("PORT", 10000)),
         webhook_url=os.getenv("WEBHOOK_URL"),
     )
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden
+
+# ---------------- CONSTANTS EXT ----------------
+PAUSE_DAYS = 30
+
+# ---------------- HELPERS EXT ----------------
+def get_user_by_house(house):
+    for r in sheet_users.get_all_records():
+        if str(r.get("Участок")) == str(house):
+            return r
+    return None
+
+def pause_notifications(row_user):
+    until = datetime.now() + timedelta(days=PAUSE_DAYS)
+    sheet_users.update_cell(row_user, 7, until.strftime("%Y-%m-%d"))
+
+def notifications_paused(user_row):
+    pause_until = sheet_users.cell(user_row, 7).value
+    if not pause_until:
+        return False
+    try:
+        return datetime.now() < datetime.strptime(pause_until, "%Y-%m-%d")
+    except:
+        return False
+
+
+# ---------------- SEND CHECK TO ADMIN ----------------
+async def notify_admin_check(context, check_row):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Подтвердить",
+                    callback_data=f"check_ok:{check_row}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отклонить",
+                    callback_data=f"check_bad:{check_row}",
+                ),
+            ]
+        ]
+    )
+
+    text = (
+        "🧾 Новый чек\n\n"
+        f"ФИО: {sheet_checks.cell(check_row, 2).value}\n"
+        f"Участок: {sheet_checks.cell(check_row, 3).value}\n"
+        f"Ссылка: {sheet_checks.cell(check_row, 5).value}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+
+
+# ---------------- CALLBACK HANDLER ----------------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    if not is_admin(uid):
+        return
+
+    action, row = query.data.split(":")
+    row = int(row)
+
+    house = sheet_checks.cell(row, 3).value
+    user = get_user_by_house(house)
+
+    if action == "check_ok":
+        sheet_checks.update_cell(row, 6, "ПОДТВЕРЖДЁН")
+
+        if user:
+            user_row = find_user_row(user["TelegramID"])
+            pause_notifications(user_row)
+
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user["TelegramID"]),
+                    text="✅ Оплата подтверждена. Уведомления приостановлены на 30 дней.",
+                )
+            except Forbidden:
+                log_stat("блокировка_бота", user["TelegramID"], "", house)
+
+        log_stat("чек_подтверждён", uid, "", house)
+        await query.edit_message_text("✅ Чек подтверждён")
+
+    if action == "check_bad":
+        sheet_checks.update_cell(row, 6, "ОТКЛОНЁН")
+
+        if user:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user["TelegramID"]),
+                    text="❌ Чек отклонён. Проверьте данные и загрузите заново.",
+                )
+            except Forbidden:
+                log_stat("блокировка_бота", user["TelegramID"], "", house)
+
+        log_stat("чек_отклонён", uid, "", house)
+        await query.edit_message_text("❌ Чек отклонён")
+
+
+# ---------------- UPDATE FILE HANDLER ----------------
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("wait_check"):
+        return
+
+    file = update.message.photo[-1] if update.message.photo else update.message.document
+
+    if is_duplicate(file.file_unique_id):
+        await update.message.reply_text("❌ Этот чек уже был загружен")
+        return
+
+    tg_file = await file.get_file()
+    data = await tg_file.download_as_bytearray()
+
+    link = upload_to_drive(
+        data,
+        f"check_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        file.mime_type,
+    )
+
+    uid = update.effective_user.id
+    row_user = find_user_row(uid)
+
+    fio = sheet_users.cell(row_user, 2).value
+    house = sheet_users.cell(row_user, 1).value
+    phone = sheet_users.cell(row_user, 4).value
+
+    sheet_checks.append_row(
+        [
+            uid,
+            fio,
+            house,
+            phone,
+            link,
+            "ОЖИДАЕТ",
+            "",
+            file.file_unique_id,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+    )
+
+    check_row = len(sheet_checks.get_all_values())
+
+    log_stat("чек_загружен", uid, update.effective_user.username, house)
+
+    await notify_admin_check(context, check_row)
+
+    context.user_data.pop("wait_check")
+    await update.message.reply_text(
+        "✅ Чек отправлен на проверку администратору",
+        reply_markup=USER_MENU,
+    )
+
+
+# ---------------- AUTO NOTIFY WITH PAUSE ----------------
+async def auto_notify(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(MOSCOW_TZ)
+    if now.hour != 18:
+        return
+
+    for r in sheet_users.get_all_records():
+        try:
+            user_row = find_user_row(r["TelegramID"])
+            if notifications_paused(user_row):
+                continue
+
+            await context.bot.send_message(
+                chat_id=int(r["TelegramID"]),
+                text=BATTLE_TEXT,
+            )
+        except Forbidden:
+            log_stat("блокировка_бота", r["TelegramID"], "", r.get("Участок"))
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+from telegram.ext import CallbackQueryHandler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from datetime import timedelta, timezone
+
+# ---------------- TIMEZONE ----------------
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+# ---------------- ANTI-SPAM ----------------
+ANTI_SPAM_SECONDS = 3
+_last_action = {}
+
+def anti_spam(uid):
+    now = datetime.now().timestamp()
+    last = _last_action.get(uid, 0)
+    if now - last < ANTI_SPAM_SECONDS:
+        return True
+    _last_action[uid] = now
+    return False
+
+
+# ---------------- ADMIN REPORTS ----------------
+async def admin_block_report(context: ContextTypes.DEFAULT_TYPE):
+    rows = sheet_stats.get_all_records()
+    blocked = [r for r in rows if r["event"] == "блокировка_бота"]
+
+    if not blocked:
+        return
+
+    text = "🚫 ОТЧЁТ ПО БЛОКИРОВКАМ\n\n"
+    for r in blocked[-10:]:
+        text += (
+            f"🕒 {r['time']}\n"
+            f"👤 UID: {r['uid']}\n"
+            f"🏠 Участок: {r['house']}\n\n"
+        )
+
+    for admin in ADMIN_IDS:
+        await context.bot.send_message(admin, text)
+
+
+# ---------------- MONTHLY FIN REPORT ----------------
+async def monthly_fin_report(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(MOSCOW_TZ)
+    month = now.strftime("%Y-%m")
+
+    checks = sheet_checks.get_all_records()
+    total = len([c for c in checks if month in c.get("Дата", "")])
+
+    text = (
+        f"📊 Финансовый отчёт за {month}\n\n"
+        f"🧾 Загружено чеков: {total}\n"
+    )
+
+    for admin in ADMIN_IDS:
+        await context.bot.send_message(admin, text)
+
+    log_stat("фин_отчёт", "", "", "", month)
+
+
+# ---------------- UPDATE TEXT HANDLER (ANTI SPAM) ----------------
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if anti_spam(uid):
+        return
+    await original_text_handler(update, context)
+
+
+# ---------------- MAIN ----------------
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # COMMANDS
+    app.add_handler(CommandHandler("start", start))
+
+    # CALLBACKS
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # FILES
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
+
+    # TEXT
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    # ---------------- SCHEDULER ----------------
+    scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+
+    # 🔔 авто-уведомления ежедневно в 18:00
+    scheduler.add_job(
+        auto_notify,
+        CronTrigger(hour=18, minute=0),
+        args=[app.bot],
+    )
+
+    # 🚫 отчёт по блокировкам (раз в неделю)
+    scheduler.add_job(
+        admin_block_report,
+        CronTrigger(day_of_week="sun", hour=12),
+        args=[app.bot],
+    )
+
+    # 📊 фин отчёт 1 числа
+    scheduler.add_job(
+        monthly_fin_report,
+        CronTrigger(day=1, hour=10),
+        args=[app.bot],
+    )
+
+    scheduler.start()
+
+    logger.info("BOT STARTED")
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        webhook_url="https://tsn-telegram-bot.onrender.com",
+    )
 
 
 if __name__ == "__main__":
