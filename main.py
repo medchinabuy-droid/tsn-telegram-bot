@@ -1,7 +1,7 @@
 import os
 import json
-import logging
 import io
+import logging
 from datetime import datetime, timedelta
 
 from aiohttp import web
@@ -21,13 +21,16 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+
+if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, DRIVE_FOLDER_ID]):
+    raise RuntimeError("❌ Не заданы обязательные ENV-переменные")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -37,7 +40,7 @@ SCOPES = [
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================== GOOGLE ==================
+# ================= GOOGLE =================
 
 creds = Credentials.from_service_account_info(
     json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
@@ -47,14 +50,16 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
-ws_users = sh.get_worksheet(0)
-ws_debts = sh.get_worksheet(1)
-ws_logs = sh.get_worksheet(2)
-ws_reqs = sh.get_worksheet(3)
+ws_users = sh.worksheet("Лист 1")
+ws_debts = sh.worksheet("Лист 2")
+ws_logs  = sh.worksheet("Лист 3")
+ws_reqs  = sh.worksheet("Реквизиты")
 
 drive = build("drive", "v3", credentials=creds)
 
-# ================== KEYBOARDS ==================
+# ================= KEYBOARDS =================
+
+START_KB = ReplyKeyboardMarkup([["🚀 Старт"]], resize_keyboard=True)
 
 USER_KB = ReplyKeyboardMarkup(
     [
@@ -74,7 +79,7 @@ ADMIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 
 def log_event(event, uid="", details=""):
     ws_logs.append_row([
@@ -86,28 +91,35 @@ def log_event(event, uid="", details=""):
 
 def get_user_row(uid):
     ids = ws_users.col_values(1)
-    if str(uid) in ids:
-        return ids.index(str(uid)) + 1
-    return None
+    return ids.index(str(uid)) + 1 if str(uid) in ids else None
 
 def get_plot(uid):
     r = get_user_row(uid)
     return ws_users.cell(r, 3).value if r else None
 
-# ================== HANDLERS ==================
+def mark_debt_paid(plot):
+    for i, r in enumerate(ws_debts.get_all_values()[1:], start=2):
+        if r[0] == plot:
+            ws_debts.update_cell(i, 4, "ОПЛАЧЕНО")
+            return
+
+# ================= HANDLERS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+
     if not get_user_row(u.id):
         ws_users.append_row([
-            u.id, u.username or "", "", datetime.now().isoformat(), ""
+            u.id,
+            u.username or "",
+            "",
+            datetime.now().isoformat(),
+            ""
         ])
-        log_event("REGISTER", u.id)
+        log_event("START", u.id)
 
     kb = ADMIN_KB if u.id in ADMIN_IDS else USER_KB
-    await update.message.reply_text("Выберите действие ⬇️", reply_markup=kb)
-
-# ---------- ДОЛГ ----------
+    await update.message.reply_text("Бот активен ✅", reply_markup=kb)
 
 async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plot = get_plot(update.effective_user.id)
@@ -117,20 +129,21 @@ async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for r in ws_debts.get_all_values()[1:]:
         if r[0] == plot:
-            await update.message.reply_text(
-                f"🔍 Участок {plot}\n💰 Долг: {r[1]}\n📅 До: {r[2]}"
-            )
+            if r[3] == "ОПЛАЧЕНО":
+                await update.message.reply_text("✅ Долг оплачен")
+            else:
+                await update.message.reply_text(
+                    f"💰 Долг: {r[1]}\n📅 До: {r[2]}"
+                )
             return
-    await update.message.reply_text("✅ Долгов нет")
 
-# ---------- ЧЕК ----------
+    await update.message.reply_text("✅ Долгов нет")
 
 async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     uid = update.effective_user.id
 
-    existing = ws_logs.findall(doc.file_unique_id)
-    if existing:
+    if ws_logs.findall(doc.file_unique_id):
         await update.message.reply_text("⚠️ Этот чек уже загружен")
         return
 
@@ -144,89 +157,31 @@ async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body=meta, media_body=media, fields="id"
     ).execute()
 
-    log_event("CHECK", uid, f"{uploaded['id']} | {doc.file_unique_id}")
-    await update.message.reply_text("✅ Чек загружен")
+    plot = get_plot(uid)
+    if plot:
+        mark_debt_paid(plot)
 
-# ---------- ADMIN ----------
+    log_event("CHECK", uid, uploaded["id"])
+    await update.message.reply_text("✅ Чек принят. Долг закрыт.")
 
-async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= ROUTER =================
+
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
     uid = update.effective_user.id
-    text = update.message.text
 
-    if text == "📣 Боевое уведомление":
-        context.user_data["await_plot"] = True
-        await update.message.reply_text("Введите номер участка:")
-        return
-
-    if context.user_data.get("await_plot"):
-        plot = text
-        context.user_data.clear()
-        sent = 0
-
-        for u in ws_users.get_all_values()[1:]:
-            if u[2] == plot:
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(u[0]),
-                        text="⚠️ ВАЖНО! У вас задолженность. Срочно оплатите."
-                    )
-                    sent += 1
-                except:
-                    log_event("BLOCKED", u[0])
-
-        log_event("MANUAL_NOTIFY", uid, f"plot={plot}, sent={sent}")
-        await update.message.reply_text(f"Отправлено: {sent}")
-        return
-
-    if text == "📊 Статистика":
-        users = len(ws_users.get_all_values()) - 1
-        debts = len(ws_debts.get_all_values()) - 1
-        checks = len([r for r in ws_logs.get_all_values() if r[1] == "CHECK"])
+    if txt == "🚀 Старт":
+        await start(update, context)
+    elif txt == "🔍 Долг по участку":
+        await debt(update, context)
+    elif txt == "📎 Загрузить чек":
+        await update.message.reply_text("Пришлите PDF или фото")
+    elif txt == "💳 Реквизиты":
         await update.message.reply_text(
-            f"📊 Статистика\n\n"
-            f"👤 Пользователей: {users}\n"
-            f"💰 Долгов: {debts}\n"
-            f"📎 Чеков: {checks}"
+            "\n".join(r[0] for r in ws_reqs.get_all_values())
         )
 
-# ---------- ROUTER ----------
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id in ADMIN_IDS:
-        await admin_text(update, context)
-        return
-
-    if update.message.text == "🔍 Долг по участку":
-        await debt(update, context)
-
-    elif update.message.text == "📎 Загрузить чек":
-        await update.message.reply_text("Пришлите PDF или фото")
-
-    elif update.message.text == "💳 Реквизиты":
-        msg = "\n".join(r[0] for r in ws_reqs.get_all_values())
-        await update.message.reply_text(msg)
-
-# ================== AUTO ==================
-
-async def auto_notify():
-    today = datetime.now().date()
-
-    for d in ws_debts.get_all_values()[1:]:
-        deadline = datetime.fromisoformat(d[2]).date()
-        days = (deadline - today).days
-        if days in (5, 3, 1):
-            for u in ws_users.get_all_values()[1:]:
-                if u[2] == d[0]:
-                    try:
-                        await app_bot.send_message(
-                            chat_id=int(u[0]),
-                            text=f"⏰ Напоминание: долг {d[1]} до {d[2]}"
-                        )
-                        log_event("AUTO_NOTIFY", u[0], f"{days} days")
-                    except:
-                        log_event("BLOCKED", u[0])
-
-# ================== WEBHOOK ==================
+# ================= WEBHOOK =================
 
 async def webhook(request):
     data = await request.json()
@@ -235,18 +190,13 @@ async def webhook(request):
     )
     return web.Response(text="ok")
 
-# ================== INIT ==================
+# ================= INIT =================
 
 application = Application.builder().token(BOT_TOKEN).build()
-app_bot = application.bot
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.Document.ALL, upload_check))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-scheduler = AsyncIOScheduler()
-scheduler.add_job(auto_notify, "cron", hour=9)
-scheduler.start()
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
 
 async def on_startup(app):
     await application.initialize()
