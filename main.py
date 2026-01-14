@@ -206,7 +206,7 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     await application.stop()
-    await application.shutdown
+    await application.shutdown()
 
 app = web.Application()
 app.router.add_post("/", webhook)
