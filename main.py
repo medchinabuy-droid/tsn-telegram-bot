@@ -2,11 +2,9 @@ import os
 import json
 import io
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiohttp import web
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -21,26 +19,36 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# ================= CONFIG =================
+# ================= LOG =================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
 if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, DRIVE_FOLDER_ID]):
-    raise RuntimeError("❌ Не заданы обязательные ENV-переменные")
+    raise RuntimeError("❌ Не заданы ENV переменные")
 
+def load_admins():
+    raw = os.getenv("ADMIN_IDS", "")
+    ids = []
+    for part in raw.replace("\n", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+ADMIN_IDS = load_admins()
+logger.info(f"ADMINS LOADED: {ADMIN_IDS}")
+
+# ================= GOOGLE =================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ================= GOOGLE =================
 
 creds = Credentials.from_service_account_info(
     json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
@@ -58,7 +66,6 @@ ws_reqs  = sh.worksheet("Реквизиты")
 drive = build("drive", "v3", credentials=creds)
 
 # ================= KEYBOARDS =================
-
 START_KB = ReplyKeyboardMarkup([["🚀 Старт"]], resize_keyboard=True)
 
 USER_KB = ReplyKeyboardMarkup(
@@ -74,13 +81,14 @@ ADMIN_KB = ReplyKeyboardMarkup(
     [
         ["📣 Боевое уведомление"],
         ["📊 Статистика"],
-        ["⬅️ Назад"]
+        ["🔍 Долг по участку"],
+        ["📎 Загрузить чек"],
+        ["💳 Реквизиты"]
     ],
     resize_keyboard=True
 )
 
 # ================= HELPERS =================
-
 def log_event(event, uid="", details=""):
     ws_logs.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -88,6 +96,9 @@ def log_event(event, uid="", details=""):
         str(uid),
         details
     ])
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 def get_user_row(uid):
     ids = ws_users.col_values(1)
@@ -97,29 +108,31 @@ def get_plot(uid):
     r = get_user_row(uid)
     return ws_users.cell(r, 3).value if r else None
 
-def mark_debt_paid(plot):
-    for i, r in enumerate(ws_debts.get_all_values()[1:], start=2):
-        if r[0] == plot:
-            ws_debts.update_cell(i, 4, "ОПЛАЧЕНО")
-            return
-
 # ================= HANDLERS =================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    uid = u.id
 
-    if not get_user_row(u.id):
+    if not get_user_row(uid):
         ws_users.append_row([
-            u.id,
+            uid,
             u.username or "",
             "",
-            datetime.now().isoformat(),
-            ""
+            datetime.now().isoformat()
         ])
-        log_event("START", u.id)
 
-    kb = ADMIN_KB if u.id in ADMIN_IDS else USER_KB
-    await update.message.reply_text("Бот активен ✅", reply_markup=kb)
+    if is_admin(uid):
+        kb = ADMIN_KB
+        role = "АДМИН"
+    else:
+        kb = USER_KB
+        role = "ПОЛЬЗОВАТЕЛЬ"
+
+    log_event("START", uid, role)
+    await update.message.reply_text(
+        f"Бот активен ✅\nРоль: {role}",
+        reply_markup=kb
+    )
 
 async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plot = get_plot(update.effective_user.id)
@@ -129,12 +142,9 @@ async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for r in ws_debts.get_all_values()[1:]:
         if r[0] == plot:
-            if r[3] == "ОПЛАЧЕНО":
-                await update.message.reply_text("✅ Долг оплачен")
-            else:
-                await update.message.reply_text(
-                    f"💰 Долг: {r[1]}\n📅 До: {r[2]}"
-                )
+            await update.message.reply_text(
+                f"💰 Долг: {r[1]}\n📅 До: {r[2]}\nСтатус: {r[3]}"
+            )
             return
 
     await update.message.reply_text("✅ Долгов нет")
@@ -144,7 +154,7 @@ async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if ws_logs.findall(doc.file_unique_id):
-        await update.message.reply_text("⚠️ Этот чек уже загружен")
+        await update.message.reply_text("⚠️ Чек уже загружен")
         return
 
     file = await doc.get_file()
@@ -157,32 +167,28 @@ async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body=meta, media_body=media, fields="id"
     ).execute()
 
-    plot = get_plot(uid)
-    if plot:
-        mark_debt_paid(plot)
-
     log_event("CHECK", uid, uploaded["id"])
-    await update.message.reply_text("✅ Чек принят. Долг закрыт.")
-
-# ================= ROUTER =================
+    await update.message.reply_text("✅ Чек загружен")
 
 async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
-    uid = update.effective_user.id
 
     if txt == "🚀 Старт":
         await start(update, context)
     elif txt == "🔍 Долг по участку":
         await debt(update, context)
     elif txt == "📎 Загрузить чек":
-        await update.message.reply_text("Пришлите PDF или фото")
+        await update.message.reply_text("Пришлите PDF или фото чека")
     elif txt == "💳 Реквизиты":
         await update.message.reply_text(
             "\n".join(r[0] for r in ws_reqs.get_all_values())
         )
+    elif txt == "📣 Боевое уведомление":
+        await update.message.reply_text("⚠️ Режим боевого уведомления (в разработке)")
+    elif txt == "📊 Статистика":
+        await update.message.reply_text("📊 Статистика будет добавлена")
 
 # ================= WEBHOOK =================
-
 async def webhook(request):
     data = await request.json()
     await application.update_queue.put(
@@ -191,7 +197,6 @@ async def webhook(request):
     return web.Response(text="ok")
 
 # ================= INIT =================
-
 application = Application.builder().token(BOT_TOKEN).build()
 
 application.add_handler(CommandHandler("start", start))
