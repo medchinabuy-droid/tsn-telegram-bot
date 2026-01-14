@@ -1,17 +1,12 @@
 import os
 import json
 import logging
-from datetime import datetime
 import asyncio
+from datetime import datetime
 
-import aiohttp
 from aiohttp import web
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,10 +29,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# ================== GOOGLE SHEETS ==================
+PORT = int(os.getenv("PORT", 10000))
+
+# ================== GOOGLE ==================
 creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 creds = Credentials.from_service_account_info(
     creds_dict,
@@ -53,23 +49,22 @@ sheet_logs = sh.worksheet("Лист 3")
 logger.info("Sheets connected")
 
 # ================== HELPERS ==================
-def log_event(event_type, tg_id, username, text):
-    sheet_logs.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        event_type,
-        tg_id,
-        username or "",
-        text
-    ])
-
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+def log_event(event_type, user, text):
+    sheet_logs.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        event_type,
+        user.id,
+        user.username or "",
+        text
+    ])
+
 # ================== KEYBOARDS ==================
-def start_keyboard(is_admin=False):
+def main_keyboard(is_admin=False):
     kb = [
         [InlineKeyboardButton("🔍 Долг по участку", callback_data="debt")],
-        [InlineKeyboardButton("📎 Загрузить чек", callback_data="upload")],
     ]
     if is_admin:
         kb.append([InlineKeyboardButton("🛠 Админ-меню", callback_data="admin")])
@@ -79,17 +74,16 @@ def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📣 Боевое уведомление", callback_data="battle")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("🔁 Ручная рассылка", callback_data="manual_send")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
     ])
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    log_event("START", user.id, user.username, "Bot started")
+    log_event("START", user, "start")
     await update.message.reply_text(
-        "👋 Добро пожаловать в ТСН «Искона-Парк»",
-        reply_markup=start_keyboard(is_admin(user.id))
+        "👋 Бот ТСН активен",
+        reply_markup=main_keyboard(is_admin(user.id))
     )
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,12 +94,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "back":
         await query.edit_message_text(
             "Главное меню",
-            reply_markup=start_keyboard(is_admin(user.id))
+            reply_markup=main_keyboard(is_admin(user.id))
         )
 
     elif query.data == "admin" and is_admin(user.id):
         await query.edit_message_text(
             "🛠 Админ-меню",
+            reply_markup=admin_keyboard()
+        )
+
+    elif query.data == "stats" and is_admin(user.id):
+        users = len(sheet_users.get_all_records())
+        logs = len(sheet_logs.get_all_records())
+        await query.edit_message_text(
+            f"📊 Статистика\n\n👥 Пользователей: {users}\n🧾 Логов: {logs}",
             reply_markup=admin_keyboard()
         )
 
@@ -132,43 +134,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"📣 ВАЖНОЕ УВЕДОМЛЕНИЕ\nУчасток {house}"
                     )
                 except:
-                    log_event("BLOCKED", r["tg_id"], r["username"], "Bot blocked")
-        log_event("BATTLE", user.id, user.username, f"House {house}")
-        await query.edit_message_text("✅ Уведомление отправлено")
+                    sheet_logs.append_row([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "BLOCKED",
+                        r["tg_id"],
+                        r["username"],
+                        "bot blocked"
+                    ])
+        await query.edit_message_text("✅ Отправлено")
 
-    elif query.data == "debt":
-        await query.edit_message_text("Введите номер участка:")
-        context.user_data["wait_debt"] = True
-
-    elif query.data == "stats" and is_admin(user.id):
-        count_users = len(sheet_users.get_all_records())
-        count_logs = len(sheet_logs.get_all_records())
-        await query.edit_message_text(
-            f"📊 Статистика\n\n👥 Пользователей: {count_users}\n📄 Логов: {count_logs}",
-            reply_markup=admin_keyboard()
-        )
-
-async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
-
-    if context.user_data.get("wait_debt"):
-        context.user_data["wait_debt"] = False
-        rows = sheet_debts.get_all_records()
-        for r in rows:
-            if str(r.get("участок")) == text:
-                await update.message.reply_text(
-                    f"💰 Долг по участку {text}: {r['сумма']} ₽",
-                    reply_markup=start_keyboard(is_admin(user.id))
-                )
-                return
-        await update.message.reply_text("❌ Долг не найден")
-
-# ================== AUTO REMINDERS ==================
-async def auto_reminders(app: Application):
-    rows = sheet_debts.get_all_records()
+# ================== AUTO ==================
+async def auto_notify(app: Application):
     users = sheet_users.get_all_records()
-    for d in rows:
+    debts = sheet_debts.get_all_records()
+    for d in debts:
         for u in users:
             if u.get("участок") == d.get("участок"):
                 try:
@@ -176,42 +155,47 @@ async def auto_reminders(app: Application):
                         chat_id=int(u["chat_id"]),
                         text=f"⏰ Напоминание: долг {d['сумма']} ₽"
                     )
-                    log_event("AUTO_NOTIFY", u["tg_id"], u["username"], "Reminder sent")
                 except:
-                    log_event("BLOCKED", u["tg_id"], u["username"], "Bot blocked")
+                    pass
 
 # ================== WEBHOOK ==================
-async def webhook(request):
+async def telegram_webhook(request):
     data = await request.json()
-    await application.update_queue.put(Update.de_json(data, application.bot))
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
     return web.Response(text="ok")
 
-# ================== START APP ==================
+async def healthcheck(request):
+    return web.Response(text="ok")
+
+# ================== MAIN ==================
 async def main():
     global application
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(callbacks))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(auto_reminders, "interval", hours=24, args=[application])
+    scheduler.add_job(auto_notify, "interval", hours=24, args=[application])
     scheduler.start()
+
+    await application.initialize()
+    await application.start()
 
     await application.bot.set_webhook(f"{WEBHOOK_URL}/{WEBHOOK_SECRET}")
 
     app = web.Application()
-    app.router.add_post(f"/{WEBHOOK_SECRET}", webhook)
+    app.router.add_get("/", healthcheck)
+    app.router.add_post(f"/{WEBHOOK_SECRET}", telegram_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    logger.info("BOT STARTED")
-    await application.initialize()
-    await application.start()
+    logger.info("BOT READY")
 
     while True:
         await asyncio.sleep(3600)
