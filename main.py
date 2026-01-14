@@ -1,222 +1,220 @@
 import os
 import json
-import io
 import logging
 from datetime import datetime
+import asyncio
 
+import aiohttp
 from aiohttp import web
-from telegram import Update, ReplyKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================= LOG =================
+# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================= ENV =================
+# ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-if not all([BOT_TOKEN, WEBHOOK_URL, SPREADSHEET_ID, DRIVE_FOLDER_ID]):
-    raise RuntimeError("❌ Не заданы ENV переменные")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-def load_admins():
-    raw = os.getenv("ADMIN_IDS", "")
-    ids = []
-    for part in raw.replace("\n", ",").split(","):
-        part = part.strip()
-        if part.isdigit():
-            ids.append(int(part))
-    return ids
-
-ADMIN_IDS = load_admins()
-logger.info(f"ADMINS LOADED: {ADMIN_IDS}")
-
-# ================= GOOGLE =================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-
+# ================== GOOGLE SHEETS ==================
+creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 creds = Credentials.from_service_account_info(
-    json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")),
-    scopes=SCOPES
+    creds_dict,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
-
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
-ws_users = sh.worksheet("Лист 1")
-ws_debts = sh.worksheet("Лист 2")
-ws_logs  = sh.worksheet("Лист 3")
-ws_reqs  = sh.worksheet("Реквизиты")
+sheet_users = sh.worksheet("Лист 1")
+sheet_debts = sh.worksheet("Лист 2")
+sheet_logs = sh.worksheet("Лист 3")
 
-drive = build("drive", "v3", credentials=creds)
+logger.info("Sheets connected")
 
-# ================= KEYBOARDS =================
-START_KB = ReplyKeyboardMarkup([["🚀 Старт"]], resize_keyboard=True)
-
-USER_KB = ReplyKeyboardMarkup(
-    [
-        ["🔍 Долг по участку"],
-        ["📎 Загрузить чек"],
-        ["💳 Реквизиты"]
-    ],
-    resize_keyboard=True
-)
-
-ADMIN_KB = ReplyKeyboardMarkup(
-    [
-        ["📣 Боевое уведомление"],
-        ["📊 Статистика"],
-        ["🔍 Долг по участку"],
-        ["📎 Загрузить чек"],
-        ["💳 Реквизиты"]
-    ],
-    resize_keyboard=True
-)
-
-# ================= HELPERS =================
-def log_event(event, uid="", details=""):
-    ws_logs.append_row([
+# ================== HELPERS ==================
+def log_event(event_type, tg_id, username, text):
+    sheet_logs.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        event,
-        str(uid),
-        details
+        event_type,
+        tg_id,
+        username or "",
+        text
     ])
 
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def get_user_row(uid):
-    ids = ws_users.col_values(1)
-    return ids.index(str(uid)) + 1 if str(uid) in ids else None
+# ================== KEYBOARDS ==================
+def start_keyboard(is_admin=False):
+    kb = [
+        [InlineKeyboardButton("🔍 Долг по участку", callback_data="debt")],
+        [InlineKeyboardButton("📎 Загрузить чек", callback_data="upload")],
+    ]
+    if is_admin:
+        kb.append([InlineKeyboardButton("🛠 Админ-меню", callback_data="admin")])
+    return InlineKeyboardMarkup(kb)
 
-def get_plot(uid):
-    r = get_user_row(uid)
-    return ws_users.cell(r, 3).value if r else None
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Боевое уведомление", callback_data="battle")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔁 Ручная рассылка", callback_data="manual_send")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
+    ])
 
-# ================= HANDLERS =================
+# ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    uid = u.id
-
-    if not get_user_row(uid):
-        ws_users.append_row([
-            uid,
-            u.username or "",
-            "",
-            datetime.now().isoformat()
-        ])
-
-    if is_admin(uid):
-        kb = ADMIN_KB
-        role = "АДМИН"
-    else:
-        kb = USER_KB
-        role = "ПОЛЬЗОВАТЕЛЬ"
-
-    log_event("START", uid, role)
+    user = update.effective_user
+    log_event("START", user.id, user.username, "Bot started")
     await update.message.reply_text(
-        f"Бот активен ✅\nРоль: {role}",
-        reply_markup=kb
+        "👋 Добро пожаловать в ТСН «Искона-Парк»",
+        reply_markup=start_keyboard(is_admin(user.id))
     )
 
-async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plot = get_plot(update.effective_user.id)
-    if not plot:
-        await update.message.reply_text("❗ Участок не указан")
-        return
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
 
-    for r in ws_debts.get_all_values()[1:]:
-        if r[0] == plot:
-            await update.message.reply_text(
-                f"💰 Долг: {r[1]}\n📅 До: {r[2]}\nСтатус: {r[3]}"
-            )
-            return
-
-    await update.message.reply_text("✅ Долгов нет")
-
-async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    uid = update.effective_user.id
-
-    if ws_logs.findall(doc.file_unique_id):
-        await update.message.reply_text("⚠️ Чек уже загружен")
-        return
-
-    file = await doc.get_file()
-    data = await file.download_as_bytearray()
-
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=doc.mime_type)
-    meta = {"name": doc.file_name, "parents": [DRIVE_FOLDER_ID]}
-
-    uploaded = drive.files().create(
-        body=meta, media_body=media, fields="id"
-    ).execute()
-
-    log_event("CHECK", uid, uploaded["id"])
-    await update.message.reply_text("✅ Чек загружен")
-
-async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text
-
-    if txt == "🚀 Старт":
-        await start(update, context)
-    elif txt == "🔍 Долг по участку":
-        await debt(update, context)
-    elif txt == "📎 Загрузить чек":
-        await update.message.reply_text("Пришлите PDF или фото чека")
-    elif txt == "💳 Реквизиты":
-        await update.message.reply_text(
-            "\n".join(r[0] for r in ws_reqs.get_all_values())
+    if query.data == "back":
+        await query.edit_message_text(
+            "Главное меню",
+            reply_markup=start_keyboard(is_admin(user.id))
         )
-    elif txt == "📣 Боевое уведомление":
-        await update.message.reply_text("⚠️ Режим боевого уведомления (в разработке)")
-    elif txt == "📊 Статистика":
-        await update.message.reply_text("📊 Статистика будет добавлена")
 
-# ================= WEBHOOK =================
+    elif query.data == "admin" and is_admin(user.id):
+        await query.edit_message_text(
+            "🛠 Админ-меню",
+            reply_markup=admin_keyboard()
+        )
+
+    elif query.data == "battle" and is_admin(user.id):
+        rows = sheet_users.get_all_records()
+        buttons = [
+            [InlineKeyboardButton(f"Участок {r['участок']}", callback_data=f"battle_{r['участок']}")]
+            for r in rows if r.get("участок")
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin")])
+        await query.edit_message_text(
+            "Выберите участок:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif query.data.startswith("battle_") and is_admin(user.id):
+        house = query.data.split("_")[1]
+        rows = sheet_users.get_all_records()
+        for r in rows:
+            if str(r.get("участок")) == house:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(r["chat_id"]),
+                        text=f"📣 ВАЖНОЕ УВЕДОМЛЕНИЕ\nУчасток {house}"
+                    )
+                except:
+                    log_event("BLOCKED", r["tg_id"], r["username"], "Bot blocked")
+        log_event("BATTLE", user.id, user.username, f"House {house}")
+        await query.edit_message_text("✅ Уведомление отправлено")
+
+    elif query.data == "debt":
+        await query.edit_message_text("Введите номер участка:")
+        context.user_data["wait_debt"] = True
+
+    elif query.data == "stats" and is_admin(user.id):
+        count_users = len(sheet_users.get_all_records())
+        count_logs = len(sheet_logs.get_all_records())
+        await query.edit_message_text(
+            f"📊 Статистика\n\n👥 Пользователей: {count_users}\n📄 Логов: {count_logs}",
+            reply_markup=admin_keyboard()
+        )
+
+async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+
+    if context.user_data.get("wait_debt"):
+        context.user_data["wait_debt"] = False
+        rows = sheet_debts.get_all_records()
+        for r in rows:
+            if str(r.get("участок")) == text:
+                await update.message.reply_text(
+                    f"💰 Долг по участку {text}: {r['сумма']} ₽",
+                    reply_markup=start_keyboard(is_admin(user.id))
+                )
+                return
+        await update.message.reply_text("❌ Долг не найден")
+
+# ================== AUTO REMINDERS ==================
+async def auto_reminders(app: Application):
+    rows = sheet_debts.get_all_records()
+    users = sheet_users.get_all_records()
+    for d in rows:
+        for u in users:
+            if u.get("участок") == d.get("участок"):
+                try:
+                    await app.bot.send_message(
+                        chat_id=int(u["chat_id"]),
+                        text=f"⏰ Напоминание: долг {d['сумма']} ₽"
+                    )
+                    log_event("AUTO_NOTIFY", u["tg_id"], u["username"], "Reminder sent")
+                except:
+                    log_event("BLOCKED", u["tg_id"], u["username"], "Bot blocked")
+
+# ================== WEBHOOK ==================
 async def webhook(request):
     data = await request.json()
-    await application.update_queue.put(
-        Update.de_json(data, application.bot)
-    )
+    await application.update_queue.put(Update.de_json(data, application.bot))
     return web.Response(text="ok")
 
-# ================= INIT =================
-application = Application.builder().token(BOT_TOKEN).build()
+# ================== START APP ==================
+async def main():
+    global application
+    application = Application.builder().token(BOT_TOKEN).build()
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.Document.ALL, upload_check))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(callbacks))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
 
-async def on_startup(app):
-    await application.initialize()
-    await application.bot.set_webhook(WEBHOOK_URL)
-    await application.start()
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(auto_reminders, "interval", hours=24, args=[application])
+    scheduler.start()
+
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/{WEBHOOK_SECRET}")
+
+    app = web.Application()
+    app.router.add_post(f"/{WEBHOOK_SECRET}", webhook)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+
     logger.info("BOT STARTED")
+    await application.initialize()
+    await application.start()
 
-async def on_shutdown(app):
-    await application.stop()
-    await application.shutdown()
-
-app = web.Application()
-app.router.add_post("/", webhook)
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    web.run_app(app, port=int(os.getenv("PORT", 8080)))
+    asyncio.run(main())
