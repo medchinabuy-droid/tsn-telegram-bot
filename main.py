@@ -243,38 +243,39 @@ async def send_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qr_url = req[5]
     if qr_url:
         await update.message.reply_photo(qr_url)
-# =========================================================
-# TSN TELEGRAM BOT — PART 2 / 2
-# =========================================================
-# Блоки:
+# ============================================================
+# PART 2 / 2
+# ============================================================
+# СОДЕРЖАНИЕ:
 # 10. Загрузка чеков
 # 11. Inline-подтверждение чеков админом
 # 12. Авто-закрытие долга
-# 13. Боевое уведомление (ALL / SELF / участок)
+# 13. Боевое уведомление (ALL / SELF / номер участка)
 # 14. Авто-уведомления в 18:00 МСК
-# 15. Статистика
-# 16. Текстовый роутер
-# 17. MAIN + Scheduler
-# =========================================================
+# 15. Статистика бота
+# 16. Роутер текстовых сообщений
+# 17. MAIN + APScheduler
+# ============================================================
 
-# =========================
-# 10. CHECK UPLOAD
-# =========================
-async def check_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_or_create_user(update)
 
-    if not is_registered(row):
+# ============================================================
+# 10. ЗАГРУЗКА ЧЕКА
+# ============================================================
+async def handle_check_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = get_user_row(user.id)
+
+    if not row:
         await update.message.reply_text("❗ Сначала завершите регистрацию")
         return
 
     file = update.message.photo[-1] if update.message.photo else update.message.document
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
-
     file_uid = file.file_unique_id
-    existing = SHEET_CHECKS.col_values(13)
-    if file_uid in existing:
-        await update.message.reply_text("❌ Этот чек уже загружен")
+
+    if file_uid in SHEET_CHECKS.col_values(13):
+        await update.message.reply_text("❌ Этот чек уже был загружен")
         return
 
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=file.mime_type)
@@ -286,51 +287,46 @@ async def check_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"https://drive.google.com/file/d/{uploaded['id']}"
 
-    user = update.effective_user
-    fio = SHEET_USERS.cell(row, 2).value
-    house = SHEET_USERS.cell(row, 1).value
-    phone = SHEET_USERS.cell(row, 5).value
-
     SHEET_CHECKS.append_row([
-        user.id,
-        user.username,
-        fio,
-        house,
-        phone,
-        link,
-        "",
+        user.id,                              # telegram_id
+        user.username or "",                  # username
+        SHEET_USERS.cell(row, 2).value,       # ФИО
+        SHEET_USERS.cell(row, 1).value,       # Участок
+        SHEET_USERS.cell(row, 5).value,       # Телефон
+        link,                                 # Ссылка на чек
+        "",                                   # Сумма по чеку
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "",
-        "",
-        "",
-        "",
+        "", "", "", "",                       # OCR поля
         file_uid,
-        "⏳ Ожидает подтверждения"
+        "⏳ На проверке"
     ])
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve:{file_uid}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{file_uid}")
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve|{file_uid}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject|{file_uid}")
     ]])
 
     for admin in ADMIN_IDS:
         await context.bot.send_message(
             admin,
-            f"📎 Новый чек\nУчасток: {house}\nФИО: {fio}",
+            f"📎 Новый чек\n"
+            f"ФИО: {SHEET_USERS.cell(row, 2).value}\n"
+            f"Участок: {SHEET_USERS.cell(row, 1).value}",
             reply_markup=keyboard
         )
 
-    await update.message.reply_text("✅ Чек отправлен на проверку")
+    log_event("check_uploaded", user.id, user.username, SHEET_USERS.cell(row, 1).value)
+    await update.message.reply_text("✅ Чек загружен и отправлен администратору")
 
 
-# =========================
-# 11. INLINE CONFIRM
-# =========================
-async def inline_check_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# 11. INLINE-ПОДТВЕРЖДЕНИЕ ЧЕКА
+# ============================================================
+async def inline_check_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    action, file_uid = query.data.split(":")
+    action, file_uid = query.data.split("|")
     col = SHEET_CHECKS.col_values(13)
 
     if file_uid not in col:
@@ -338,35 +334,38 @@ async def inline_check_decision(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     row = col.index(file_uid) + 1
+    house = SHEET_CHECKS.cell(row, 4).value
 
     if action == "approve":
         SHEET_CHECKS.update_cell(row, 14, "✅ Подтверждён")
-        house = SHEET_CHECKS.cell(row, 4).value
         close_debt(house)
-        await query.edit_message_text("✅ Чек подтверждён, долг закрыт")
+        log_event("check_approved", "", "", house)
+        await query.edit_message_text("✅ Чек подтверждён. Долг закрыт.")
 
-    if action == "reject":
+    elif action == "reject":
         SHEET_CHECKS.update_cell(row, 14, "❌ Отклонён")
-        await query.edit_message_text("❌ Чек отклонён")
+        log_event("check_rejected", "", "", house)
+        await query.edit_message_text("❌ Чек отклонён.")
 
 
-# =========================
-# 12. AUTO CLOSE DEBT
-# =========================
+# ============================================================
+# 12. АВТО-ЗАКРЫТИЕ ДОЛГА
+# ============================================================
 def close_debt(house):
     col = SHEET_USERS.col_values(1)
     if house in col:
-        row = col.index(house) + 1
-        SHEET_USERS.update_cell(row, 10, "Оплачено")
-        log_event("auto_close", "", "", house, "долг закрыт")
+        r = col.index(house) + 1
+        SHEET_USERS.update_cell(r, 10, "Оплачено")
+        SHEET_USERS.update_cell(r, 12, "")  # очистка даты напоминания
 
 
-# =========================
-# 13. BATTLE NOTIFICATION
-# =========================
+# ============================================================
+# 13. БОЕВОЕ УВЕДОМЛЕНИЕ
+# ============================================================
 async def battle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["battle"] = True
+    context.user_data["battle_mode"] = True
     await update.message.reply_text(
+        "📣 Боевое уведомление\n\n"
         "Введите:\n"
         "ALL — всем\n"
         "SELF — себе\n"
@@ -376,95 +375,95 @@ async def battle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def battle_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = update.message.text.strip()
-    context.user_data.pop("battle", None)
+    context.user_data.pop("battle_mode", None)
 
     sent = 0
-    users = SHEET_USERS.get_all_records()
+    for u in SHEET_USERS.get_all_records():
+        try:
+            if target == "ALL":
+                chat_id = int(u["Telegram_ID"])
+            elif target == "SELF":
+                chat_id = update.effective_user.id
+            elif target.isdigit() and str(u["Участок"]) == target:
+                chat_id = int(u["Telegram_ID"])
+            else:
+                continue
 
-    for u in users:
-        if target == "ALL" or \
-           (target == "SELF" and int(u["Telegram_ID"]) in ADMIN_IDS) or \
-           (target.isdigit() and str(u["Участок"]) == target):
+            await context.bot.send_message(chat_id, BATTLE_TEXT)
+            sent += 1
+        except:
+            log_event("blocked", u.get("Telegram_ID"), u.get("username"))
 
-            try:
-                await context.bot.send_message(
-                    int(u["Telegram_ID"]),
-                    "⚠️ Напоминание о задолженности"
-                )
-                sent += 1
-            except:
-                log_event("blocked", u["Telegram_ID"], u["username"])
-
-    await update.message.reply_text(f"📣 Отправлено: {sent}")
+    log_event("battle_sent", update.effective_user.id, update.effective_user.username, "", f"sent={sent}")
+    await update.message.reply_text(f"📨 Отправлено уведомлений: {sent}")
 
 
-# =========================
-# 14. AUTO REMINDERS 18:00
-# =========================
+# ============================================================
+# 14. АВТО-РАССЫЛКА В 18:00 МСК
+# ============================================================
 async def auto_reminders():
     today = datetime.now(MOSCOW_TZ).day
-    users = SHEET_USERS.get_all_records()
 
-    for u in users:
-        pay_day = u.get("День_оплаты")
-        if not pay_day:
-            continue
+    for u in SHEET_USERS.get_all_records():
+        try:
+            pay_day = int(u.get("День_оплаты", 0))
+            if not pay_day:
+                continue
 
-        if today >= int(pay_day) - 5 and u.get("Статус") != "Оплачено":
-            try:
+            if today >= pay_day - 5 and u.get("Статус") != "Оплачено":
                 await app.bot.send_message(
                     int(u["Telegram_ID"]),
-                    "⏰ Напоминание: приближается дата оплаты"
+                    "⏰ Напоминание: приближается дата оплаты взноса"
                 )
-            except:
-                log_event("blocked", u["Telegram_ID"], u["username"])
+                log_event("auto_notify", u["Telegram_ID"], u.get("username"), u.get("Участок"))
+        except:
+            log_event("blocked", u.get("Telegram_ID"), u.get("username"))
 
 
-# =========================
-# 15. STATS
-# =========================
+# ============================================================
+# 15. СТАТИСТИКА
+# ============================================================
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = SHEET_USERS.get_all_records()
     logs = SHEET_LOGS.get_all_records()
 
-    blocked = [l["UID"] for l in logs if l["Тип"] == "blocked"]
+    blocked = [str(l["UID"]) for l in logs if l["Тип"] == "blocked"]
+    sent = len([l for l in logs if "notify" in l["Тип"] or "battle" in l["Тип"]])
 
-    text = (
+    await update.message.reply_text(
         "📊 Статистика бота\n\n"
         f"👥 Пользователей: {len(users)}\n"
         f"⛔ Заблокировали: {len(blocked)}\n"
-        f"📨 Уведомлений: {len([l for l in logs if 'уведом' in l['Тип']])}\n\n"
-        f"Blocked IDs: {', '.join(map(str, blocked))}"
+        f"📨 Уведомлений отправлено: {sent}\n\n"
+        f"Blocked: {', '.join(blocked)}"
     )
 
-    await update.message.reply_text(text)
 
-
-# =========================
-# 16. TEXT ROUTER
-# =========================
+# ============================================================
+# 16. РОУТЕР ТЕКСТА
+# ============================================================
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if context.user_data.get("reg_step"):
-        await registration_handler(update, context)
+        await registration_flow(update, context)
         return
 
-    if context.user_data.get("battle"):
+    if context.user_data.get("battle_mode"):
         await battle_send(update, context)
         return
 
     if text == "🚀 Начать":
         await start(update, context)
 
-    elif text == "💳 Реквизиты":
-        await send_requisites(update, context)
-
     elif text == "📎 Загрузить чек":
         await update.message.reply_text("📎 Отправьте фото или PDF чека")
 
+    elif text == "💳 Реквизиты":
+        await send_requisites(update, context)
+
     elif text == "🛠 Админ-панель" and is_admin(update.effective_user.id):
-        await update.message.reply_text("Админ-панель", reply_markup=ADMIN_PANEL)
+        await update.message.reply_text("🛠 Админ-панель", reply_markup=ADMIN_PANEL)
 
     elif text == "📣 Боевое уведомление":
         await battle_start(update, context)
@@ -473,22 +472,19 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_stats(update, context)
 
     elif text == "⬅️ Назад":
-        await update.message.reply_text(
-            "Главное меню",
-            reply_markup=ADMIN_MENU
-        )
+        await update.message.reply_text("Главное меню", reply_markup=ADMIN_MENU)
 
 
-# =========================
-# 17. MAIN
-# =========================
+# ============================================================
+# 17. MAIN + SCHEDULER
+# ============================================================
 def main():
     global app
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(inline_check_decision))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, check_upload))
+    app.add_handler(CallbackQueryHandler(inline_check_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_check_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     scheduler = BackgroundScheduler(timezone=MOSCOW_TZ)
