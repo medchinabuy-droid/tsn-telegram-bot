@@ -1,6 +1,21 @@
 # =========================================================
-# 1. IMPORTS
+# TSN TELEGRAM BOT — PART 1 / 2
 # =========================================================
+# Блоки:
+# 1. Imports
+# 2. ENV
+# 3. Logging
+# 4. Google Sheets / Drive
+# 5. Меню
+# 6. Хелперы
+# 7. Регистрация
+# 8. /start
+# 9. Реквизиты + QR картинкой
+# =========================================================
+
+# =========================
+# 1. IMPORTS
+# =========================
 import os
 import json
 import logging
@@ -8,12 +23,18 @@ import re
 import io
 from datetime import datetime, timedelta
 
+import pytz
+import gspread
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,70 +44,60 @@ from telegram.ext import (
     filters,
 )
 
-import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-from apscheduler.schedulers.background import BackgroundScheduler
-import pytz
-
-# =========================================================
-# 2. LOGGING
-# =========================================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# =========================================================
-# 3. ENV
-# =========================================================
+# =========================
+# 2. ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-# =========================================================
+# =========================
+# 3. LOGGING
+# =========================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TSN-BOT")
+
+# =========================
 # 4. GOOGLE
-# =========================================================
-creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-scopes = [
+# =========================
+creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+
+SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+
+creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
 
 gc = gspread.authorize(creds)
 drive = build("drive", "v3", credentials=creds)
 
 sh = gc.open_by_key(SPREADSHEET_ID)
-sheet_users = sh.worksheet("Лист 1")
-sheet_checks = sh.worksheet("Лист 2")
-sheet_stats = sh.worksheet("Лист 3")
-sheet_reqs = sh.worksheet("Реквизиты")
 
-# =========================================================
-# 5. CONSTANTS
-# =========================================================
-BATTLE_TEXT = (
-    "⚠️ Уважаемый собственник!\n\n"
-    "У вас имеется задолженность по взносам ТСН.\n"
-    "Просим срочно погасить долг.\n\n"
-    "Если оплата произведена — загрузите чек в бота."
-)
+SHEET_USERS = sh.worksheet("Лист 1")
+SHEET_CHECKS = sh.worksheet("Лист 2")
+SHEET_LOGS = sh.worksheet("Лист 3")
+SHEET_REQS = sh.worksheet("Реквизиты")
 
-# =========================================================
-# 6. MENUS
-# =========================================================
+# =========================
+# 5. MENUS
+# =========================
 USER_MENU = ReplyKeyboardMarkup(
     [["🚀 Начать"], ["📎 Загрузить чек", "💳 Реквизиты"]],
-    resize_keyboard=True,
+    resize_keyboard=True
 )
 
 ADMIN_MENU = ReplyKeyboardMarkup(
     [["🚀 Начать"], ["🛠 Админ-панель"], ["📎 Загрузить чек", "💳 Реквизиты"]],
-    resize_keyboard=True,
+    resize_keyboard=True
 )
 
 ADMIN_PANEL = ReplyKeyboardMarkup(
@@ -96,326 +107,400 @@ ADMIN_PANEL = ReplyKeyboardMarkup(
         ["📊 Статистика"],
         ["⬅️ Назад"],
     ],
-    resize_keyboard=True,
+    resize_keyboard=True
 )
 
-# =========================================================
-# 7. HELPERS
-# =========================================================
-def is_admin(uid):
+# =========================
+# 6. HELPERS
+# =========================
+def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 
-def log_event(event_type, uid="", username="", house="", details="", error=""):
-    sheet_stats.append_row(
-        [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            event_type,
-            uid,
-            username,
-            house,
-            details,
-            error,
-        ]
-    )
+def log_event(event, uid="", username="", section="", details="", error=""):
+    SHEET_LOGS.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        event,
+        uid,
+        username,
+        section,
+        details,
+        error
+    ])
 
 
-def find_user_row(uid):
-    col = sheet_users.col_values(3)
-    for i, v in enumerate(col, start=2):
-        if v == str(uid):
+def find_user_row(username: str):
+    if not username:
+        return None
+    col = SHEET_USERS.col_values(4)
+    for i, val in enumerate(col, start=2):
+        if val == username:
             return i
     return None
 
 
-def is_registered(uid):
-    row = find_user_row(uid)
-    if not row:
-        return False
-    return bool(sheet_users.cell(row, 1).value and sheet_users.cell(row, 5).value)
+def get_or_create_user(update: Update):
+    user = update.effective_user
+    username = user.username or ""
+    uid = user.id
 
-
-def valid_fio(t): return len(t.split()) >= 2
-def valid_phone(t): return bool(re.fullmatch(r"\+7\d{10}", t))
-
-
-def is_duplicate(file_uid):
-    return file_uid in sheet_checks.col_values(13)
-
-
-def upload_to_drive(data, name, mime):
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
-    f = drive.files().create(
-        body={"name": name, "parents": [DRIVE_FOLDER_ID]},
-        media_body=media,
-        fields="id",
-    ).execute()
-    return f["id"]
-
-# =========================================================
-# 8. START
-# =========================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    username = update.effective_user.username or ""
-    context.user_data.clear()
-
-    log_event("start", uid, username)
-
-    row = find_user_row(uid)
-    menu = ADMIN_MENU if is_admin(uid) else USER_MENU
-
+    row = find_user_row(username)
     if row:
-        fio = sheet_users.cell(row, 2).value
-        await update.message.reply_text(
-            f"👋 С возвращением, {fio}",
-            reply_markup=menu,
-        )
-    else:
-        context.user_data["step"] = "fio"
-        await update.message.reply_text(
-            "👋 Добро пожаловать!\n\nВведите ФИО:",
-            reply_markup=ReplyKeyboardMarkup([["🚀 Начать"]], resize_keyboard=True),
-        )
+        SHEET_USERS.update_cell(row, 3, str(uid))
+        return row
 
-# =========================================================
-# 9. TEXT HANDLER
-# =========================================================
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    SHEET_USERS.append_row([
+        "", "", uid, username, "", "", "", "", "", "", "", ""
+    ])
+    return SHEET_USERS.row_count
+
+
+def is_registered(row):
+    fio = SHEET_USERS.cell(row, 2).value
+    phone = SHEET_USERS.cell(row, 5).value
+    house = SHEET_USERS.cell(row, 1).value
+    return bool(fio and phone and house)
+
+
+def valid_fio(text):
+    return len(text.split()) >= 2
+
+
+def valid_phone(text):
+    return bool(re.fullmatch(r"\+7\d{10}", text))
+
+
+# =========================
+# 7. REGISTRATION FLOW
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = get_or_create_user(update)
+
+    if is_registered(row):
+        await update.message.reply_text(
+            "Вы уже зарегистрированы ✅",
+            reply_markup=ADMIN_MENU if is_admin(user.id) else USER_MENU
+        )
+        return
+
+    context.user_data["reg_step"] = "fio"
+    await update.message.reply_text("👋 Добро пожаловать!\nВведите ФИО:")
+
+
+async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = get_or_create_user(update)
+    step = context.user_data.get("reg_step")
     text = update.message.text.strip()
-    uid = update.effective_user.id
-    username = update.effective_user.username or ""
-    step = context.user_data.get("step")
 
-    if text == "🚀 Начать":
-        await start(update, context)
-        return
-
-    if not is_registered(uid) and not step:
-        await update.message.reply_text("❗ Сначала завершите регистрацию")
-        return
-
-    # -------- REGISTRATION --------
     if step == "fio":
         if not valid_fio(text):
             await update.message.reply_text("Введите ФИО полностью")
             return
-        sheet_users.append_row(["", text, uid, username])
-        context.user_data["step"] = "phone"
-        await update.message.reply_text("Введите телефон +7XXXXXXXXXX")
+        SHEET_USERS.update_cell(row, 2, text)
+        context.user_data["reg_step"] = "phone"
+        await update.message.reply_text("Введите телефон в формате +79998887766")
         return
 
     if step == "phone":
         if not valid_phone(text):
-            await update.message.reply_text("Формат +7XXXXXXXXXX")
+            await update.message.reply_text("Неверный формат телефона")
             return
-        row = find_user_row(uid)
-        sheet_users.update_cell(row, 5, text)
-        context.user_data["step"] = "house"
+        SHEET_USERS.update_cell(row, 5, text)
+        context.user_data["reg_step"] = "house"
         await update.message.reply_text("Введите номер участка")
         return
 
     if step == "house":
-        row = find_user_row(uid)
-        sheet_users.update_cell(row, 1, text)
-        context.user_data.clear()
-        log_event("registration", uid, username, text)
+        SHEET_USERS.update_cell(row, 1, text)
+        context.user_data.pop("reg_step", None)
+
         await update.message.reply_text(
             "✅ Регистрация завершена",
-            reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU,
+            reply_markup=ADMIN_MENU if is_admin(update.effective_user.id) else USER_MENU
         )
+        log_event("registration", update.effective_user.id, update.effective_user.username)
         return
 
-    # -------- ADMIN PANEL --------
-    if text == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text("Админ-панель", reply_markup=ADMIN_PANEL)
-        return
 
-    if text == "⬅️ Назад":
-        await update.message.reply_text(
-            "Главное меню",
-            reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU,
-        )
-        return
+# =========================
+# 8. REQUISITES + QR
+# =========================
+async def send_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    req = SHEET_REQS.row_values(2)
 
-    # -------- BATTLE --------
-    if text == "📣 Боевое уведомление" and is_admin(uid):
-        context.user_data["battle"] = True
-        await update.message.reply_text("Введите участок / ALL / SELF")
-        return
+    text = (
+        f"💳 Реквизиты:\n\n"
+        f"Банк: {req[0]}\n"
+        f"БИК: {req[1]}\n"
+        f"Счёт: {req[2]}\n"
+        f"Получатель: {req[3]}\n"
+        f"ИНН: {req[4]}"
+    )
 
-    if context.user_data.get("battle"):
-        context.user_data.pop("battle")
-        sent = 0
-        blocked = []
+    await update.message.reply_text(text)
 
-        for r in sheet_users.get_all_records():
-            if text in ("ALL", str(r["Участок"])) or text == "SELF":
-                chat_id = uid if text == "SELF" else int(r["Telegram_ID"])
-                try:
-                    await context.bot.send_message(chat_id, BATTLE_TEXT)
-                    sent += 1
-                except Exception as e:
-                    blocked.append(str(chat_id))
-                    log_event("blocked", chat_id, "", "", "", str(e))
-
-        log_event("battle_send", uid, username, text, f"sent={sent}")
-        await update.message.reply_text(
-            f"📣 Отправлено: {sent}\n⛔ Заблокировали: {', '.join(blocked)}",
-            reply_markup=ADMIN_PANEL,
-        )
-        return
-
-    # -------- STATS --------
-    if text == "📊 Статистика" and is_admin(uid):
-        users = len(sheet_users.get_all_records())
-        checks = len(sheet_checks.get_all_records())
-        battles = len([r for r in sheet_stats.get_all_records() if r["Тип"] == "battle_send"])
-        blocked = [r["UID"] for r in sheet_stats.get_all_records() if r["Тип"] == "blocked"]
-
-        await update.message.reply_text(
-            "📊 Статистика бота\n\n"
-            f"👥 Пользователей: {users}\n"
-            f"📎 Чеков загружено: {checks}\n"
-            f"📣 Уведомлений отправлено: {battles}\n"
-            f"⛔ Заблокировали: {len(blocked)}\n"
-            f"{', '.join(blocked)}",
-            reply_markup=ADMIN_PANEL,
-        )
-        return
-
-    # -------- REQUISITES --------
-    if text == "💳 Реквизиты":
-        r = sheet_reqs.row_values(2)
-        await update.message.reply_text(
-            f"💳 Реквизиты\n\n"
-            f"Банк: {r[0]}\nБИК: {r[1]}\n"
-            f"Счёт: {r[2]}\nПолучатель: {r[3]}\nИНН: {r[4]}"
-        )
-        if r[5]:
-            await context.bot.send_photo(uid, r[5], caption="📲 QR для оплаты")
-        return
-
-    # -------- CHECK --------
-    if text == "📎 Загрузить чек":
-        context.user_data["wait_check"] = True
-        await update.message.reply_text("Отправьте фото или PDF чека")
-        return
-
+    qr_url = req[5]
+    if qr_url:
+        await update.message.reply_photo(qr_url)
 # =========================================================
-# 10. FILE HANDLER + INLINE CONFIRM
+# TSN TELEGRAM BOT — PART 2 / 2
 # =========================================================
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("wait_check"):
+# Блоки:
+# 10. Загрузка чеков
+# 11. Inline-подтверждение чеков админом
+# 12. Авто-закрытие долга
+# 13. Боевое уведомление (ALL / SELF / участок)
+# 14. Авто-уведомления в 18:00 МСК
+# 15. Статистика
+# 16. Текстовый роутер
+# 17. MAIN + Scheduler
+# =========================================================
+
+# =========================
+# 10. CHECK UPLOAD
+# =========================
+async def check_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = get_or_create_user(update)
+
+    if not is_registered(row):
+        await update.message.reply_text("❗ Сначала завершите регистрацию")
         return
 
     file = update.message.photo[-1] if update.message.photo else update.message.document
+    tg_file = await file.get_file()
+    data = await tg_file.download_as_bytearray()
 
-    if is_duplicate(file.file_unique_id):
+    file_uid = file.file_unique_id
+    existing = SHEET_CHECKS.col_values(13)
+    if file_uid in existing:
         await update.message.reply_text("❌ Этот чек уже загружен")
         return
 
-    tg_file = await file.get_file()
-    data = await tg_file.download_as_bytearray()
-    drive_id = upload_to_drive(data, "check", file.mime_type)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=file.mime_type)
+    uploaded = drive.files().create(
+        body={"name": f"check_{file_uid}", "parents": [DRIVE_FOLDER_ID]},
+        media_body=media,
+        fields="id"
+    ).execute()
 
-    uid = update.effective_user.id
-    row = find_user_row(uid)
+    link = f"https://drive.google.com/file/d/{uploaded['id']}"
 
-    sheet_checks.append_row([
-        uid,
-        update.effective_user.username,
-        sheet_users.cell(row, 2).value,
-        sheet_users.cell(row, 1).value,
-        sheet_users.cell(row, 5).value,
-        f"https://drive.google.com/file/d/{drive_id}",
+    user = update.effective_user
+    fio = SHEET_USERS.cell(row, 2).value
+    house = SHEET_USERS.cell(row, 1).value
+    phone = SHEET_USERS.cell(row, 5).value
+
+    SHEET_CHECKS.append_row([
+        user.id,
+        user.username,
+        fio,
+        house,
+        phone,
+        link,
         "",
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "",
         "",
         "",
         "",
-        file.file_unique_id,
-        "new",
+        file_uid,
+        "⏳ Ожидает подтверждения"
     ])
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve:{uid}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{uid}")
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve:{file_uid}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{file_uid}")
+    ]])
 
     for admin in ADMIN_IDS:
         await context.bot.send_message(
             admin,
-            f"📎 Новый чек от {sheet_users.cell(row,2).value}\n"
-            f"https://drive.google.com/file/d/{drive_id}",
-            reply_markup=keyboard,
+            f"📎 Новый чек\nУчасток: {house}\nФИО: {fio}",
+            reply_markup=keyboard
         )
 
-    context.user_data.pop("wait_check")
     await update.message.reply_text("✅ Чек отправлен на проверку")
 
-# =========================================================
-# 11. CALLBACK (APPROVE / REJECT)
-# =========================================================
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# =========================
+# 11. INLINE CONFIRM
+# =========================
+async def inline_check_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    action, uid = query.data.split(":")
-    uid = int(uid)
+    action, file_uid = query.data.split(":")
+    col = SHEET_CHECKS.col_values(13)
+
+    if file_uid not in col:
+        await query.edit_message_text("❌ Чек не найден")
+        return
+
+    row = col.index(file_uid) + 1
 
     if action == "approve":
-        row = find_user_row(uid)
-        sheet_users.update_cell(row, 10, "Оплачен")
-        sheet_users.update_cell(row, 8, 0)
-        log_event("check_approved", uid)
+        SHEET_CHECKS.update_cell(row, 14, "✅ Подтверждён")
+        house = SHEET_CHECKS.cell(row, 4).value
+        close_debt(house)
         await query.edit_message_text("✅ Чек подтверждён, долг закрыт")
 
     if action == "reject":
-        log_event("check_rejected", uid)
+        SHEET_CHECKS.update_cell(row, 14, "❌ Отклонён")
         await query.edit_message_text("❌ Чек отклонён")
 
-# =========================================================
-# 12. AUTO REMINDERS 18:00 MSK
-# =========================================================
-async def auto_reminders(app: Application):
-    now = datetime.now(MOSCOW_TZ)
-    for r in sheet_users.get_all_records():
-        if r["Статус"] != "Оплачен":
-            try:
-                await app.bot.send_message(int(r["Telegram_ID"]), BATTLE_TEXT)
-            except:
-                pass
 
-# =========================================================
-# 13. MAIN
-# =========================================================
-def main():
-    scheduler = BackgroundScheduler(timezone=MOSCOW_TZ)
-    scheduler.add_job(
-        lambda: auto_reminders(app),
-        "cron",
-        hour=18,
-        minute=0,
+# =========================
+# 12. AUTO CLOSE DEBT
+# =========================
+def close_debt(house):
+    col = SHEET_USERS.col_values(1)
+    if house in col:
+        row = col.index(house) + 1
+        SHEET_USERS.update_cell(row, 10, "Оплачено")
+        log_event("auto_close", "", "", house, "долг закрыт")
+
+
+# =========================
+# 13. BATTLE NOTIFICATION
+# =========================
+async def battle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["battle"] = True
+    await update.message.reply_text(
+        "Введите:\n"
+        "ALL — всем\n"
+        "SELF — себе\n"
+        "или номер участка (например 81)"
     )
-    scheduler.start()
 
+
+async def battle_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message.text.strip()
+    context.user_data.pop("battle", None)
+
+    sent = 0
+    users = SHEET_USERS.get_all_records()
+
+    for u in users:
+        if target == "ALL" or \
+           (target == "SELF" and int(u["Telegram_ID"]) in ADMIN_IDS) or \
+           (target.isdigit() and str(u["Участок"]) == target):
+
+            try:
+                await context.bot.send_message(
+                    int(u["Telegram_ID"]),
+                    "⚠️ Напоминание о задолженности"
+                )
+                sent += 1
+            except:
+                log_event("blocked", u["Telegram_ID"], u["username"])
+
+    await update.message.reply_text(f"📣 Отправлено: {sent}")
+
+
+# =========================
+# 14. AUTO REMINDERS 18:00
+# =========================
+async def auto_reminders():
+    today = datetime.now(MOSCOW_TZ).day
+    users = SHEET_USERS.get_all_records()
+
+    for u in users:
+        pay_day = u.get("День_оплаты")
+        if not pay_day:
+            continue
+
+        if today >= int(pay_day) - 5 and u.get("Статус") != "Оплачено":
+            try:
+                await app.bot.send_message(
+                    int(u["Telegram_ID"]),
+                    "⏰ Напоминание: приближается дата оплаты"
+                )
+            except:
+                log_event("blocked", u["Telegram_ID"], u["username"])
+
+
+# =========================
+# 15. STATS
+# =========================
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = SHEET_USERS.get_all_records()
+    logs = SHEET_LOGS.get_all_records()
+
+    blocked = [l["UID"] for l in logs if l["Тип"] == "blocked"]
+
+    text = (
+        "📊 Статистика бота\n\n"
+        f"👥 Пользователей: {len(users)}\n"
+        f"⛔ Заблокировали: {len(blocked)}\n"
+        f"📨 Уведомлений: {len([l for l in logs if 'уведом' in l['Тип']])}\n\n"
+        f"Blocked IDs: {', '.join(map(str, blocked))}"
+    )
+
+    await update.message.reply_text(text)
+
+
+# =========================
+# 16. TEXT ROUTER
+# =========================
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if context.user_data.get("reg_step"):
+        await registration_handler(update, context)
+        return
+
+    if context.user_data.get("battle"):
+        await battle_send(update, context)
+        return
+
+    if text == "🚀 Начать":
+        await start(update, context)
+
+    elif text == "💳 Реквизиты":
+        await send_requisites(update, context)
+
+    elif text == "📎 Загрузить чек":
+        await update.message.reply_text("📎 Отправьте фото или PDF чека")
+
+    elif text == "🛠 Админ-панель" and is_admin(update.effective_user.id):
+        await update.message.reply_text("Админ-панель", reply_markup=ADMIN_PANEL)
+
+    elif text == "📣 Боевое уведомление":
+        await battle_start(update, context)
+
+    elif text == "📊 Статистика":
+        await show_stats(update, context)
+
+    elif text == "⬅️ Назад":
+        await update.message.reply_text(
+            "Главное меню",
+            reply_markup=ADMIN_MENU
+        )
+
+
+# =========================
+# 17. MAIN
+# =========================
+def main():
     global app
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(CallbackQueryHandler(inline_check_decision))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, check_upload))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    scheduler = BackgroundScheduler(timezone=MOSCOW_TZ)
+    scheduler.add_job(lambda: app.create_task(auto_reminders()), "cron", hour=18, minute=0)
+    scheduler.start()
 
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
-        webhook_url="https://tsn-telegram-bot.onrender.com",
+        webhook_url=os.getenv("WEBHOOK_URL")
     )
+
 
 if __name__ == "__main__":
     main()
