@@ -1,443 +1,442 @@
-# =========================================================
-# ЧАСТЬ 1. БАЗОВАЯ ИНИЦИАЛИЗАЦИЯ И КОНФИГ
-# =========================================================
+# ===============================
+# TSN ISKONA PARK — TELEGRAM BOT
+# MAIN.PY (PART 1 / 2)
+# ===============================
 
 import os
+import json
 import logging
 import asyncio
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
+import pytz
 
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
+from telegram.error import Forbidden
 
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from io import BytesIO
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# ===============================
+# ENV
+# ===============================
 
-# =========================================================
-# НАСТРОЙКИ (ОБЯЗАТЕЛЬНО ПРОВЕРЬ)
-# =========================================================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен Telegram
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "ТСН")
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-# Google Service Account JSON (путь)
-GOOGLE_CREDS_FILE = "credentials.json"
+GOOGLE_DRIVE_FOLDER_ID = os.environ["GOOGLE_DRIVE_FOLDER_ID"]
 
-# ID Google таблицы
-SPREADSHEET_ID = "PUT_YOUR_SPREADSHEET_ID_HERE"
+TIMEZONE = pytz.timezone("Europe/Moscow")
 
-# Папка с QR-кодом (QR должен лежать тут как ФАЙЛ)
-QR_IMAGE_PATH = "static/qr.png"
+# ===============================
+# LOGGING
+# ===============================
 
-# Админы (telegram_id)
-ADMINS = {6810194645}  # <-- добавь нужные ID
-
-
-# =========================================================
-# ЛОГИРОВАНИЕ
-# =========================================================
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# =========================================================
-# GOOGLE SHEETS ПОДКЛЮЧЕНИЕ
-# =========================================================
+# ===============================
+# GOOGLE AUTH (IMPORTANT)
+# ===============================
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-creds = Credentials.from_service_account_file(
-    GOOGLE_CREDS_FILE, scopes=SCOPES
-)
+creds_dict = json.loads(GOOGLE_CREDS_JSON)
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+
 gc = gspread.authorize(creds)
+sh = gc.open_by_key(SPREADSHEET_ID)
 
-spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+sheet_users = sh.worksheet("Лист 1")
+sheet_checks = sh.worksheet("Лист 2")
+sheet_logs = sh.worksheet("Лист 3")
 
-# --- Листы ---
-sheet_users = spreadsheet.sheet1  # Лист 1
-sheet_checks = spreadsheet.get_worksheet(1)  # Лист 2
-sheet_logs = spreadsheet.get_worksheet(2)  # Лист 3
+drive_service = build("drive", "v3", credentials=creds)
 
+# ===============================
+# KEYBOARDS
+# ===============================
 
-# =========================================================
-# СОСТОЯНИЯ ДЛЯ ConversationHandler
-# =========================================================
+def main_keyboard(is_admin=False):
+    kb = [
+        [KeyboardButton("💳 Реквизиты")],
+        [KeyboardButton("📎 Загрузить чек")],
+    ]
+    if is_admin:
+        kb.append([KeyboardButton("🛠 Админ-панель")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-(
-    REG_FIO,
-    REG_PHONE,
-    REG_PLOT,
-    REG_PAYDAY,
-    WAIT_CHECK,
-    ADMIN_BROADCAST,
-) = range(6)
+def admin_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🔍 Долг по участку")],
+            [KeyboardButton("📣 Боевое уведомление")],
+            [KeyboardButton("📊 Статистика")],
+        ],
+        resize_keyboard=True,
+    )
 
+# ===============================
+# HELPERS
+# ===============================
 
-# =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ РАБОТЫ С ТАБЛИЦЕЙ
-# =========================================================
+def log_event(event_type, uid="", username="", plot="", event="", details="", error=""):
+    sheet_logs.append_row([
+        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+        event_type,
+        uid,
+        username,
+        plot,
+        event,
+        details,
+        error,
+    ])
 
-def find_user_row(telegram_id: int):
-    """
-    Ищем пользователя ТОЛЬКО по telegram_id.
-    Возвращает номер строки или None.
-    """
-    try:
-        ids = sheet_users.col_values(4)  # Telegram_ID колонка
-        if str(telegram_id) in ids:
-            return ids.index(str(telegram_id)) + 1
-    except Exception as e:
-        logger.error(f"Ошибка поиска пользователя: {e}")
+def get_user_by_tg(tg_id):
+    rows = sheet_users.get_all_records()
+    for r in rows:
+        if str(r.get("Telegram_ID")) == str(tg_id):
+            return r
     return None
 
+def get_user_by_plot(plot):
+    rows = sheet_users.get_all_records()
+    for r in rows:
+        if str(r.get("Участок")) == str(plot):
+            return r
+    return None
 
-def is_registered(telegram_id: int) -> bool:
-    """Проверка регистрации пользователя"""
-    return find_user_row(telegram_id) is not None
-
-
-def add_user_one_row(data: dict):
-    """
-    ❗ КРИТИЧНО
-    Добавляем пользователя СТРОГО В ОДНУ СТРОКУ
-    (ты жаловался, что добавляется в две — здесь исправлено)
-    """
-    row = [
-        data.get("plot"),
-        data.get("fio"),
-        data.get("telegram_id"),
-        data.get("username"),
-        data.get("phone"),
-        data.get("payday"),
-        "",  # Электро
-        "",  # Сумма
-        "",  # Дата
-        "АКТИВЕН",
-        "USER",
-        "",  # Дата_напоминания
-    ]
-    sheet_users.append_row(row, value_input_option="USER_ENTERED")
-
-
-def log_event(event_type: str, uid: int, username: str, plot: str, details: str = "", error: str = ""):
-    """
-    Логирование всех событий (Лист 3)
-    """
-    sheet_logs.append_row(
-        [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            event_type,
-            uid,
-            username,
-            plot,
-            details,
-            error,
-        ],
-        value_input_option="USER_ENTERED",
-    )
-
-
-# =========================================================
-# КЛАВИАТУРЫ
-# =========================================================
-
-def main_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["🚀 Начать"],
-            ["💳 Реквизиты", "📎 Загрузить чек"],
-            ["🛠 Админ-панель"],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["📣 Боевое уведомление"],
-            ["📊 Статистика"],
-            ["⬅ Назад"],
-        ],
-        resize_keyboard=True,
-    )
-
-
-# =========================================================
-# /start
-# =========================================================
+# ===============================
+# START / REGISTRATION
+# ===============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    is_admin = user.id in ADMIN_IDS
+
+    existing = get_user_by_tg(user.id)
+    if existing:
+        await update.message.reply_text(
+            "👋 С возвращением!",
+            reply_markup=main_keyboard(is_admin),
+        )
+        return
+
+    context.user_data["reg_step"] = "fio"
+    await update.message.reply_text("👋 Добро пожаловать!\nВведите ФИО:")
+
+async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("reg_step") != "fio":
+        return
+
+    fio = update.message.text.strip()
+    user = update.effective_user
+
+    sheet_users.append_row([
+        "",                     # Участок
+        fio,                    # ФИО
+        user.id,                # Telegram_ID
+        user.username or "",    # username
+        "", "", "", "", "", "", "", "", ""
+    ])
 
     log_event(
-        "START",
+        "register",
+        uid=user.id,
+        username=user.username,
+        event="Регистрация",
+        details=fio,
+    )
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "✅ Регистрация завершена",
+        reply_markup=main_keyboard(user.id in ADMIN_IDS),
+    )
+
+# ===============================
+# REQUISITES + QR
+# ===============================
+
+async def requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "💳 Реквизиты:\n\n"
+        "Банк: БАНКА ВТБ (ПАО)\n"
+        "БИК: 44525411\n"
+        "Счёт: 40703810900810019988\n"
+        "Получатель: ТСН \"ИСКОНА ПАРК\"\n"
+        "ИНН: 5028040362"
+    )
+    await update.message.reply_text(text)
+
+    try:
+        with open("qr.png", "rb") as qr:
+            await update.message.reply_photo(photo=qr)
+    except Exception as e:
+        logger.error(e)
+
+# ===============================
+# CHECK UPLOAD
+# ===============================
+
+async def ask_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📎 Отправьте фото или PDF чека")
+
+async def receive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    file = None
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        filename = f"{user.id}_{int(datetime.now().timestamp())}.jpg"
+    elif update.message.document:
+        file = await update.message.document.get_file()
+        filename = update.message.document.file_name
+    else:
+        return
+
+    buffer = BytesIO()
+    await file.download_to_memory(out=buffer)
+    buffer.seek(0)
+
+    media = MediaIoBaseUpload(buffer, mimetype="application/octet-stream")
+    drive_file = drive_service.files().create(
+        body={
+            "name": filename,
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
+        },
+        media_body=media,
+        fields="id",
+    ).execute()
+
+    sheet_checks.append_row([
         user.id,
         user.username or "",
         "",
-        "Нажал /start",
-    )
+        "",
+        "",
+        drive_file["id"],
+        "",
+        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+        "",
+        "",
+        "",
+        file.file_id,
+        "ожидает",
+    ])
 
-    await update.message.reply_text(
-        "👋 Добро пожаловать!\n\n"
-        "Этот бот помогает:\n"
-        "• отправлять чеки\n"
-        "• получать реквизиты\n"
-        "• получать уведомления\n\n"
-        "Нажмите 🚀 Начать",
-        reply_markup=main_menu(),
-    )
+    log_event("check", uid=user.id, event="Чек загружен", details=filename)
 
+    await update.message.reply_text("✅ Чек принят. Ожидайте подтверждения администратора.")
+# ===============================
+# ADMIN PANEL
+# ===============================
 
-# =========================================================
-# НАЧАЛО РЕГИСТРАЦИИ
-# =========================================================
-
-async def begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    if is_registered(user.id):
-        await update.message.reply_text(
-            "✅ Вы уже зарегистрированы",
-            reply_markup=main_menu(),
-        )
-        return ConversationHandler.END
-
-    context.user_data.clear()
-
+    if user.id not in ADMIN_IDS:
+        return
     await update.message.reply_text(
-        "👤 Введите ФИО:",
+        "🛠 Админ-панель",
+        reply_markup=admin_keyboard(),
     )
-    return REG_FIO
 
+# ===============================
+# DEBT BY PLOT
+# ===============================
 
-async def reg_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["fio"] = update.message.text.strip()
-    await update.message.reply_text("📞 Введите телефон:")
-    return REG_PHONE
+async def ask_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите номер участка:")
 
+async def show_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    plot = update.message.text.strip()
+    user_row = get_user_by_plot(plot)
 
-async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("🏠 Введите номер участка:")
-    return REG_PLOT
+    if not user_row:
+        await update.message.reply_text("❌ Участок не найден")
+        return
 
+    debt = user_row.get("Долг", "0")
+    await update.message.reply_text(
+        f"🏠 Участок {plot}\n💰 Долг: {debt}"
+    )
 
-async def reg_plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["plot"] = update.message.text.strip()
-    await update.message.reply_text("📅 Введите день оплаты (1–30):")
-    return REG_PAYDAY
+# ===============================
+# NOTIFICATION (BY PLOT)
+# ===============================
 
+async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📣 Уведомление\n\n"
+        "Введите номер участка, которому нужно отправить уведомление:"
+    )
 
-async def reg_payday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def notify_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    plot = update.message.text.strip()
+    admin = update.effective_user
+
+    user_row = get_user_by_plot(plot)
+    if not user_row:
+        await update.message.reply_text("❌ Участок не найден")
+        return
+
+    tg_id = user_row.get("Telegram_ID")
+    if not tg_id:
+        await update.message.reply_text("❌ У участка нет Telegram ID")
+        return
+
     try:
-        payday = int(update.message.text.strip())
-        if payday < 1 or payday > 30:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❗ Введите число от 1 до 30")
-        return REG_PAYDAY
+        await context.bot.send_message(
+            chat_id=int(tg_id),
+            text=(
+                f"📢 Уведомление по участку {plot}\n\n"
+                "Пожалуйста, проверьте информацию в ТСН."
+            ),
+        )
+        log_event(
+            "notify",
+            uid=tg_id,
+            plot=plot,
+            event="Уведомление отправлено",
+            details=f"Админ {admin.id}",
+        )
+        await update.message.reply_text("✅ Уведомление отправлено")
 
-    user = update.effective_user
+    except Forbidden:
+        log_event(
+            "blocked",
+            uid=tg_id,
+            plot=plot,
+            event="Пользователь заблокировал бота",
+        )
+        await update.message.reply_text("⛔ Пользователь заблокировал бота")
 
-    data = {
-        "fio": context.user_data["fio"],
-        "phone": context.user_data["phone"],
-        "plot": context.user_data["plot"],
-        "payday": payday,
-        "telegram_id": user.id,
-        "username": user.username or "",
-    }
+# ===============================
+# STATISTICS
+# ===============================
 
-    add_user_one_row(data)
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = sheet_users.get_all_records()
+    logs = sheet_logs.get_all_records()
 
-    log_event(
-        "REGISTER",
-        user.id,
-        user.username or "",
-        data["plot"],
-        "Пользователь зарегистрирован",
-    )
+    total_users = len(users)
+    blocked = len([l for l in logs if l["Тип"] == "blocked"])
+    notifications = len([l for l in logs if l["Тип"] == "notify"])
 
     await update.message.reply_text(
-        "✅ Регистрация завершена!",
-        reply_markup=main_menu(),
-    )
-    return ConversationHandler.END
-
-
-# =========================================================
-# ПРОВЕРКА ДОСТУПА (ИСПОЛЬЗУЕТСЯ В ЧАСТИ 2)
-# =========================================================
-
-async def require_registration(update: Update):
-    await update.message.reply_text(
-        "❗ Сначала завершите регистрацию\n\n"
-        "Нажмите 🚀 Начать и заполните данные"
+        "📊 Статистика бота\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"⛔ Заблокировали: {blocked}\n"
+        f"📨 Уведомлений отправлено: {notifications}"
     )
 
+# ===============================
+# AUTO NOTIFICATIONS (18:00 MSK)
+# ===============================
 
-# =========================================================
-# ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ
-# =========================================================
+async def auto_notifications():
+    today = datetime.now(TIMEZONE).day
+    rows = sheet_users.get_all_records()
 
-def build_app():
-    application = Application.builder().token(BOT_TOKEN).build()
+    for r in rows:
+        pay_day = r.get("День_оплаты")
+        tg_id = r.get("Telegram_ID")
+        plot = r.get("Участок")
 
-    registration_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🚀 Начать$"), begin_registration)],
-        states={
-            REG_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_fio)],
-            REG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone)],
-            REG_PLOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_plot)],
-            REG_PAYDAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_payday)],
-        },
-        fallbacks=[],
-    )
+        if not pay_day or not tg_id:
+            continue
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(registration_conv)
+        try:
+            pay_day = int(pay_day)
+        except:
+            continue
 
-    return application
+        if today >= pay_day - 5 and today <= pay_day:
+            try:
+                await application.bot.send_message(
+                    chat_id=int(tg_id),
+                    text=(
+                        f"⏰ Напоминание по оплате\n\n"
+                        f"Участок {plot}\n"
+                        "Срок оплаты приближается."
+                    ),
+                )
+                log_event(
+                    "auto_notify",
+                    uid=tg_id,
+                    plot=plot,
+                    event="Авто-уведомление",
+                )
+            except Forbidden:
+                log_event(
+                    "blocked",
+                    uid=tg_id,
+                    plot=plot,
+                    event="Авто: пользователь заблокировал бота",
+                )
 
+# ===============================
+# APP INIT
+# ===============================
 
-# =========================================================
-# ТОЧКА ВХОДА
-# =========================================================
+application = Application.builder().token(BOT_TOKEN).build()
+
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🚀 Начать$"), start))
+
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^💳 Реквизиты$"), requisites))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📎 Загрузить чек$"), ask_check))
+application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, receive_check))
+
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🛠 Админ-панель$"), admin_panel))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🔍 Долг по участку$"), ask_debt))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📣 Уведомление$"), notify_start))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Статистика$"), stats))
+
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, show_debt))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, notify_send))
+
+# ===============================
+# SCHEDULER
+# ===============================
+
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+scheduler.add_job(auto_notifications, "cron", hour=18, minute=0)
+scheduler.start()
+
+# ===============================
+# RUN
+# ===============================
 
 if __name__ == "__main__":
-    app = build_app()
-
-    scheduler = AsyncIOScheduler()
-    scheduler.start()
-
-    logger.info("Бот запущен")
-    app.run_polling()
-# =========================================================
-# ЧАСТЬ 2. ОСНОВНАЯ ЛОГИКА БОТА
-# =========================================================
-
-import pytz
-from telegram.error import Forbidden
-
-
-MOSCOW_TZ = pytz.timezone("Europe/Moscow")
-
-
-# =========================================================
-# 💳 РЕКВИЗИТЫ + QR
-# =========================================================
-
-PAY_TEXT = (
-    "💳 Реквизиты:\n\n"
-    "Банк: БАНК ВТБ (ПАО)\n"
-    "БИК: 44525411\n"
-    "Счёт: 40703810900810019988\n"
-    "Получатель: ТСН «ИСКОНА ПАРК»\n"
-    "ИНН: 5028040362"
-)
-
-
-async def show_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(PAY_TEXT)
-
-    if os.path.exists(QR_IMAGE_PATH):
-        await update.message.reply_photo(open(QR_IMAGE_PATH, "rb"))
-    else:
-        await update.message.reply_text("❗ QR-код временно недоступен")
-
-
-# =========================================================
-# 📎 ЗАГРУЗКА ЧЕКА
-# =========================================================
-
-async def upload_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_registered(update.effective_user.id):
-        await require_registration(update)
-        return ConversationHandler.END
-
-    await update.message.reply_text("📎 Отправьте фото или PDF чека")
-    return WAIT_CHECK
-
-
-async def save_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row = find_user_row(user.id)
-
-    if not row:
-        return ConversationHandler.END
-
-    file = None
-    ext = ""
-
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-        ext = "jpg"
-    elif update.message.document:
-        file = await update.message.document.get_file()
-        ext = "pdf"
-    else:
-        await update.message.reply_text("❗ Пришлите фото или PDF")
-        return WAIT_CHECK
-
-    filename = f"checks/{user.id}_{int(datetime.now().timestamp())}.{ext}"
-    os.makedirs("checks", exist_ok=True)
-    await file.download_to_drive(filename)
-
-    plot = sheet_users.cell(row, 1).value
-
-    sheet_checks.append_row(
-        [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            user.id,
-            plot,
-            filename,
-            "ОЖИДАЕТ",
-        ],
-        value_input_option="USER_ENTERED",
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        webhook_url=os.environ["WEBHOOK_URL"],
     )
-
-    # inline-кнопки
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Подтвердить", callback_data=f"check_ok:{user.id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"check_no:{user.id}"),
-            ]
-        ]
-    )
-
-    for admin in ADMINS:
-        await context.bot.send_message(
-            admin,
-            f"📎 Новый чек\nУчасток: {plot}",
-            reply_markup=kb,
-        )
-
-    await update.message.reply_text("✅ Чек отправлен на проверку")
-    return ConversationHandler.END
-
-
-# =========================================================
