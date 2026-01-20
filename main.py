@@ -87,6 +87,9 @@ def log_stat(event, uid="", house="", comment=""):
         event, uid, house, comment
     ])
 
+def load_users():
+    return sheet_users.get_all_records()
+
 def find_user_row(uid):
     ids = sheet_users.col_values(3)
     for i, v in enumerate(ids, start=1):
@@ -97,23 +100,17 @@ def find_user_row(uid):
 def is_duplicate(file_uid):
     return file_uid in sheet_checks.col_values(11)
 
-def upload_to_drive(data, name, mime):
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
-    f = drive.files().create(
-        body={"name": name, "parents": [DRIVE_FOLDER_ID]},
-        media_body=media,
-        fields="id"
-    ).execute()
-    return f"https://drive.google.com/file/d/{f['id']}"
-
 # ================= AUTO REMINDERS =================
 async def auto_reminders(app: Application):
     today = datetime.now(TZ).day
-    rows = sheet_users.get_all_records()
+    rows = load_users()
 
     for r in rows:
         try:
-            if int(r.get("День_оплаты", 0)) != today:
+            pay_day = str(r.get("День_оплаты", "")).strip()
+            if not pay_day.isdigit():
+                continue
+            if int(pay_day) != today:
                 continue
 
             debt = float(str(r.get("Сумма", "0")).replace(",", "."))
@@ -123,24 +120,22 @@ async def auto_reminders(app: Application):
             if r.get("Статус", "").upper() == "ОПЛАЧЕНО":
                 continue
 
-            chat_id = int(r["TelegramID"])
-            await app.bot.send_message(chat_id, REMINDER_TEXT)
-            log_stat("авто_уведомление", chat_id, r.get("Участок"))
+            tg_id = r.get("TelegramID")
+            if not tg_id:
+                continue
+
+            await app.bot.send_message(int(tg_id), REMINDER_TEXT)
+            log_stat("авто_уведомление", tg_id, r.get("Участок"))
 
         except Exception as e:
-            for admin in ADMIN_IDS:
-                await app.bot.send_message(
-                    admin,
-                    f"🚫 Блокировка бота\nУчасток: {r.get('Участок')}\n{e}"
-                )
-            log_stat("blocked", r.get("TelegramID"), r.get("Участок"), str(e))
+            log_stat("ошибка_уведомления", r.get("TelegramID"), r.get("Участок"), str(e))
 
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     context.user_data.clear()
-    log_stat("start", uid)
     menu = ADMIN_MENU if is_admin(uid) else USER_MENU
+    log_stat("start", uid)
     await update.message.reply_text("👋 Добро пожаловать", reply_markup=menu)
 
 # ================= TEXT HANDLER =================
@@ -165,24 +160,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("notify"):
         context.user_data.clear()
         sent = 0
-        for r in sheet_users.get_all_records():
-            if str(r.get("Участок")) == text:
+        for r in load_users():
+            if str(r.get("Участок")) == text and r.get("TelegramID"):
                 try:
                     await context.bot.send_message(int(r["TelegramID"]), REMINDER_TEXT)
                     sent += 1
-                except:
-                    pass
+                except Exception as e:
+                    log_stat("blocked", r["TelegramID"], text, str(e))
         log_stat("ручное_уведомление", uid, text, f"sent={sent}")
         return await update.message.reply_text(f"Отправлено: {sent}")
 
-    # ---- ДОЛГ ПО УЧАСТКУ ----
+    # ---- ДОЛГ ----
     if text == "🔍 Долг по участку" and is_admin(uid):
         context.user_data["debt"] = True
         return await update.message.reply_text("Введите номер участка")
 
     if context.user_data.get("debt"):
         context.user_data.clear()
-        for r in sheet_users.get_all_records():
+        for r in load_users():
             if str(r.get("Участок")) == text:
                 msg = (
                     f"🏠 Участок: {r.get('Участок')}\n"
@@ -193,71 +188,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🤖 Бот: {'OK' if r.get('TelegramID') else 'Нет'}"
                 )
                 return await update.message.reply_text(msg)
-
         return await update.message.reply_text("❌ Участок не найден")
 
     # ---- РЕКВИЗИТЫ ----
-    if text == "💳 Реквизиты":
-        r = sheet_reqs.get_all_records()[0]
-        msg = (
-            f"🏦 Банк: {r['Банк']}\n"
-            f"🔢 БИК: {r['БИК']}\n"
-            f"💳 Счёт: {r['Счёт получателя']}\n"
-            f"👤 Получатель: {r['Получатель']}\n"
-            f"🧾 ИНН: {r['ИНН']}"
-        )
-        await update.message.reply_text(msg)
-        if r.get("QR_оплата"):
-            await context.bot.send_photo(update.effective_chat.id, r["QR_оплата"])
-        return
-
-    # ---- ЧЕК ----
-    if text == "📎 Загрузить чек":
-        context.user_data["wait_check"] = True
-        return await update.message.reply_text("Отправьте фото чека")
-
-# ================= FILE HANDLER =================
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("wait_check"):
-        return
-
-    file = update.message.photo[-1] if update.message.photo else update.message.document
-    if is_duplicate(file.file_unique_id):
-        return await update.message.reply_text("❌ Чек уже был загружен")
-
-    tg_file = await file.get_file()
-    data = await tg_file.download_as_bytearray()
-    upload_to_drive(data, "check", file.mime_type)
-
-    uid = update.effective_user.id
-    row = find_user_row(uid)
-    if row:
-        sheet_users.update_cell(row, 5, "0")
-        sheet_users.update_cell(row, 6, "ОПЛАЧЕНО")
-        pause = (datetime.now(TZ) + timedelta(days=30)).strftime("%Y-%m-%d")
-        sheet_users.update_cell(row, 7, pause)
-
-    log_stat("чек", uid)
-    context.user_data.clear()
-    await update.message.reply_text("✅ Чек принят, долг закрыт", reply_markup=USER_MENU)
-
-# ================= MAIN =================
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(auto_reminders, "cron", hour=18, minute=0, args=[app])
-    scheduler.start()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url="https://tsn-telegram-bot.onrender.com"
-    )
-
-if __name__ == "__main__":
-    main()
