@@ -2,10 +2,8 @@ import os
 import json
 import logging
 import io
-import hashlib
 from datetime import datetime, timedelta, time
 import pytz
-import requests
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -21,6 +19,7 @@ from googleapiclient.http import MediaIoBaseUpload
 # ---------------- LOG ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 TZ = pytz.timezone("Europe/Moscow")
 
 # ---------------- ENV ----------------
@@ -60,7 +59,7 @@ ADMIN_MENU = ReplyKeyboardMarkup(
 )
 
 ADMIN_PANEL = ReplyKeyboardMarkup(
-    [["🔍 Долг по участку"], ["⬅️ Назад"]],
+    [["🔍 Долг по участку"], ["📊 Статистика"], ["⬅️ Назад"]],
     resize_keyboard=True
 )
 
@@ -80,27 +79,15 @@ def log_event(event, uid="", username="", house="", details="", error=""):
             details,
             error
         ])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"LOG SKIPPED: {e}")
 
-def get_last_bot_status(uid):
-    rows = sheet_logs.get_all_records()
-    for r in reversed(rows):
-        if str(r.get("UID")) == str(uid) and r.get("Тип") == "blocked":
-            return "❌ заблокирован"
-    return "✅ активен"
-
-def hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-def is_duplicate(file_uid, file_hash):
-    records = sheet_checks.get_all_records()
-    for r in records:
-        if r.get("File_Unique_ID") == file_uid:
-            return True
-        if r.get("OCR") == file_hash:
-            return True
-    return False
+def find_user_row(uid):
+    ids = sheet_users.col_values(3)
+    for i, v in enumerate(ids, start=1):
+        if v == str(uid):
+            return i
+    return None
 
 def upload_to_drive(data, name, mime):
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
@@ -111,14 +98,51 @@ def upload_to_drive(data, name, mime):
     ).execute()
     return f"https://drive.google.com/file/d/{f['id']}"
 
-def download_image(url):
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    return r.content
+def is_duplicate(file_uid):
+    return file_uid in sheet_checks.col_values(13)
+
+# ---------------- AUTO MONTHLY NOTIFY ----------------
+async def monthly_notify(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TZ).date()
+
+    for r in sheet_users.get_all_records():
+        try:
+            pay_day = int(r.get("День_оплаты") or 0)
+            if pay_day == 0:
+                continue
+
+            debt = float(str(r.get("Сумма") or "0").replace(",", "."))
+            if debt <= 0 or str(r.get("Статус")).upper() == "ОПЛАЧЕНО":
+                continue
+
+            start_day = pay_day - 5
+            if not (start_day <= today.day <= pay_day):
+                continue
+
+            await context.bot.send_message(
+                int(r["Telegram_ID"]),
+                "⏰ Напоминание ТСН\n\n"
+                "У вас есть задолженность.\n"
+                "Просим произвести оплату.\n\n"
+                "После оплаты загрузите чек в бота."
+            )
+
+            log_event("auto_notify", r["Telegram_ID"], r.get("username"), r.get("Участок"))
+
+        except Exception as e:
+            log_event(
+                "blocked",
+                r.get("Telegram_ID"),
+                r.get("username"),
+                r.get("Участок"),
+                error=str(e)
+            )
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    menu = ADMIN_MENU if is_admin(update.effective_user.id) else USER_MENU
+    context.user_data.clear()
+    uid = update.effective_user.id
+    menu = ADMIN_MENU if is_admin(uid) else USER_MENU
     await update.message.reply_text("👋 Добро пожаловать", reply_markup=menu)
 
 # ---------------- TEXT ----------------
@@ -147,32 +171,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         for r in sheet_users.get_all_records():
             if str(r.get("Участок")) == text:
-                bot_status = get_last_bot_status(r.get("Telegram_ID"))
                 await update.message.reply_text(
                     f"🏠 Участок: {text}\n"
-                    f"📞 Телефон: {r.get('Телефон')}\n"
-                    f"💰 Сумма: {r.get('Сумма')}\n"
-                    f"📌 Статус: {r.get('Статус')}\n"
-                    f"👤 Username: @{r.get('username')}\n"
-                    f"🤖 Бот: {bot_status}",
+                    f"ФИО: {r.get('ФИО')}\n"
+                    f"Телефон: {r.get('Телефон')}\n"
+                    f"Сумма: {r.get('Сумма')}\n"
+                    f"Статус: {r.get('Статус')}\n"
+                    f"Username: @{r.get('username')}",
                     reply_markup=ADMIN_PANEL
                 )
                 return
-        await update.message.reply_text("❌ Участок не найден", reply_markup=ADMIN_PANEL)
+        await update.message.reply_text("❌ Не найдено", reply_markup=ADMIN_PANEL)
 
     if text == "💳 Реквизиты":
         r = sheet_reqs.row_values(2)
         await update.message.reply_text(
             f"💳 Реквизиты\n\n"
-            f"Банк: {r[0]}\n"
-            f"БИК: {r[1]}\n"
-            f"Счёт: {r[2]}\n"
-            f"Получатель: {r[3]}\n"
-            f"ИНН: {r[4]}"
+            f"Банк: {r[0]}\nБИК: {r[1]}\n"
+            f"Счёт: {r[2]}\nПолучатель: {r[3]}\nИНН: {r[4]}"
         )
         if r[5]:
-            img = download_image(r[5])
-            await update.message.reply_photo(photo=img)
+            await update.message.reply_photo(r[5])
 
     if text == "📎 Загрузить чек":
         context.user_data["wait_check"] = True
@@ -184,12 +203,13 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file = update.message.photo[-1] if update.message.photo else update.message.document
+
+    if is_duplicate(file.file_unique_id):
+        await update.message.reply_text("❌ Чек уже был")
+        return
+
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
-
-    file_hash = hash_bytes(data)
-    duplicate = is_duplicate(file.file_unique_id, file_hash)
-
     link = upload_to_drive(data, "check", file.mime_type)
 
     sheet_checks.append_row([
@@ -203,20 +223,23 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "",
         "",
-        file_hash,
-        "YES" if duplicate else "NO",
+        "",
+        "",
         file.file_unique_id,
         "новый"
     ])
 
     context.user_data.clear()
-    await update.message.reply_text(
-        "❌ Дубль чека" if duplicate else "✅ Чек принят"
-    )
+    await update.message.reply_text("✅ Чек принят")
 
 # ---------------- MAIN ----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    app.job_queue.run_daily(
+        monthly_notify,
+        time=time(hour=18, minute=0, tzinfo=TZ)
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
