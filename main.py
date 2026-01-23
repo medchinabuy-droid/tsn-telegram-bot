@@ -249,3 +249,231 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # ---------- ОБРАБОТКА ВВОДА УЧАСТКА (АДМИН) ----------
+    if context.user_data.get("wait_house") and is_admin(uid):
+        context.user_data.pop("wait_house")
+
+        for r in sheet_users.get_all_records():
+            if str(r.get("Участок")) == text:
+                status_bot = "❌ Заблокировал бота" if not r.get("Telegram_ID") else "✅ Активен"
+
+                await update.message.reply_text(
+                    f"🏠 Участок № {text}\n\n"
+                    f"👤 ФИО: {r.get('ФИО')}\n"
+                    f"📱 Телефон: {r.get('Телефон')}\n"
+                    f"💰 Задолженность: {r.get('Сумма')} ₽\n"
+                    f"👤 Username: @{r.get('username')}\n"
+                    f"🤖 Статус бота: {status_bot}",
+                    reply_markup=ADMIN_PANEL
+                )
+                return
+
+        await update.message.reply_text("❌ Участок не найден.", reply_markup=ADMIN_PANEL)
+        return
+
+    # ---------- АДМИН: РУЧНОЕ УВЕДОМЛЕНИЕ ----------
+    if text == "📣 Уведомление" and is_admin(uid):
+        context.user_data["notify_house"] = True
+        await update.message.reply_text(
+            "Введите номер участка.\n"
+            "ℹ️ Будет отправлено официальное уведомление."
+        )
+        return
+
+    if context.user_data.get("notify_house") and is_admin(uid):
+        context.user_data.pop("notify_house")
+
+        for r in sheet_users.get_all_records():
+            if str(r.get("Участок")) == text and r.get("Telegram_ID"):
+                try:
+                    await context.bot.send_message(
+                        int(r["Telegram_ID"]),
+                        "📣 Уведомление ТСН «Искона-Парк»\n\n"
+                        "Уважаемый(ая)!\n\n"
+                        "Просим Вас оплатить поселковые взносы.\n"
+                        "У Вас имеется задолженность.\n\n"
+                        "С уважением,\n"
+                        "Правление ТСН"
+                    )
+                    log_event("manual_notify", r["Telegram_ID"], r.get("username"), text)
+                except Exception as e:
+                    log_event("blocked", r["Telegram_ID"], r.get("username"), text, error=str(e))
+
+        await update.message.reply_text("✅ Уведомление обработано.", reply_markup=ADMIN_PANEL)
+        return
+
+    # ---------- РЕКВИЗИТЫ ----------
+    if text == "💳 Реквизиты":
+        r = sheet_reqs.row_values(2)
+
+        await update.message.reply_text(
+            f"💳 Реквизиты для оплаты поселковых взносов\n\n"
+            f"🏦 Банк: {r[0]}\n"
+            f"🔢 БИК: {r[1]}\n"
+            f"💼 Счёт: {r[2]}\n"
+            f"👤 Получатель: {r[3]}\n"
+            f"🧾 ИНН: {r[4]}\n\n"
+            f"⬇️ QR-код для оплаты:"
+        )
+
+        if r[5]:
+            try:
+                qr_bytes = download_qr_as_bytes(r[5])
+                await update.message.reply_photo(qr_bytes)
+            except Exception as e:
+                logger.error(e)
+
+        return
+
+    # ---------- ЗАГРУЗКА ЧЕКА ----------
+    if text == "📎 Загрузить чек":
+        context.user_data["wait_check"] = True
+        await update.message.reply_text(
+            "📎 Пожалуйста, отправьте фото или PDF чека.\n"
+            "ℹ️ После загрузки вы получите подтверждение."
+        )
+        return
+
+
+# =====================================================
+# 📎 FILE HANDLER — ЧЕКИ
+# =====================================================
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("wait_check"):
+        return
+
+    msg = update.message
+    file = msg.photo[-1] if msg.photo else msg.document
+
+    # --- дубль ---
+    if is_duplicate(file.file_unique_id):
+        await msg.reply_text("⚠️ Этот чек уже был загружен ранее.")
+        log_event("duplicate_check", update.effective_user.id)
+        context.user_data.clear()
+        return
+
+    tg_file = await file.get_file()
+    data = await tg_file.download_as_bytearray()
+
+    link = upload_to_drive(
+        data,
+        f"check_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        file.mime_type
+    )
+
+    uid = update.effective_user.id
+    row = find_user_row(uid)
+
+    fio = house = phone = ""
+    if row:
+        fio = sheet_users.cell(row, 2).value
+        house = sheet_users.cell(row, 1).value
+        phone = sheet_users.cell(row, 5).value
+
+    sheet_checks.append_row([
+        uid,
+        update.effective_user.username or "",
+        fio,
+        house,
+        phone,
+        link,
+        "",
+        datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+        "",
+        "",
+        "",
+        file.file_unique_id,
+        "новый"
+    ])
+
+    log_event("check_uploaded", uid, update.effective_user.username, house)
+
+    context.user_data.clear()
+    await msg.reply_text(
+        "✅ Чек успешно сохранён.\n"
+        "Спасибо! После проверки задолженность будет закрыта 🙏",
+        reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
+    )
+
+
+# =====================================================
+# ⏰ АВТО-УВЕДОМЛЕНИЯ (5 / 3 / 1 ДЕНЬ)
+# =====================================================
+async def monthly_notify(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TZ).date()
+
+    for r in sheet_users.get_all_records():
+        try:
+            pay_day = int(r.get("День_оплаты") or 0)
+            if not pay_day or not r.get("Telegram_ID"):
+                continue
+
+            debt = float(str(r.get("Сумма") or "0").replace(",", "."))
+            if debt <= 0:
+                continue
+
+            uid = int(r["Telegram_ID"])
+            fio = r.get("ФИО")
+
+            if today.day == pay_day - 5:
+                text = notify_text_5(fio, debt)
+            elif today.day == pay_day - 3:
+                text = notify_text_3(fio, debt)
+            elif today.day == pay_day - 1:
+                text = notify_text_1(fio, debt)
+            else:
+                continue
+
+            await context.bot.send_message(uid, text)
+            log_event("auto_notify", uid, r.get("username"), r.get("Участок"))
+
+        except Exception as e:
+            log_event("blocked", r.get("Telegram_ID"), r.get("username"), r.get("Участок"), error=str(e))
+
+
+# =====================================================
+# 📊 СТАТИСТИКА
+# =====================================================
+async def send_stats(update: Update):
+    users = sheet_users.get_all_records()
+    total = len(users)
+
+    blocked = [
+        r.get("username")
+        for r in users
+        if not r.get("Telegram_ID")
+    ]
+
+    await update.message.reply_text(
+        "📊 Статистика ТСН «Искона-Парк»\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"⛔ Заблокировали бота: {len(blocked)}\n\n"
+        f"Список:\n{', '.join(blocked) if blocked else '—'}"
+    )
+
+
+# =====================================================
+# 🚦 MAIN
+# =====================================================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.job_queue.run_daily(
+        monthly_notify,
+        time=time(hour=18, minute=0, tzinfo=TZ)
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        webhook_url="https://tsn-telegram-bot.onrender.com"
+    )
+
+
+if __name__ == "__main__":
+    main()
