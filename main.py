@@ -3,7 +3,7 @@ import json
 import logging
 import io
 import requests
-from datetime import datetime, timedelta, time
+from datetime import datetime, time
 import pytz
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -18,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # =====================================================
-# 🔧 НАСТРОЙКИ И ЛОГИ
+# 🔧 НАСТРОЙКИ
 # =====================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
 # =====================================================
-# 📊 GOOGLE SHEETS / DRIVE
+# 📊 GOOGLE API
 # =====================================================
 creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 creds = Credentials.from_service_account_info(
@@ -55,19 +55,12 @@ sheet_reqs = sh.worksheet("Реквизиты")
 # 🧭 МЕНЮ
 # =====================================================
 USER_MENU = ReplyKeyboardMarkup(
-    [
-        ["🚀 Начать"],
-        ["📎 Загрузить чек", "💳 Реквизиты"]
-    ],
+    [["📎 Загрузить чек", "💳 Реквизиты"]],
     resize_keyboard=True
 )
 
 ADMIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["🚀 Начать"],
-        ["🛠 Админ-панель"],
-        ["📎 Загрузить чек", "💳 Реквизиты"]
-    ],
+    [["🛠 Админ-панель"], ["📎 Загрузить чек", "💳 Реквизиты"]],
     resize_keyboard=True
 )
 
@@ -82,26 +75,25 @@ ADMIN_PANEL = ReplyKeyboardMarkup(
 )
 
 # =====================================================
-# 🛠 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 🛠 ВСПОМОГАТЕЛЬНЫЕ
 # =====================================================
-def is_admin(uid: int) -> bool:
+def is_admin(uid):
     return uid in ADMIN_IDS
-
 
 def log_event(event, uid="", username="", house="", details="", error=""):
     try:
         sheet_logs.append_row([
             datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            event,
-            uid,
-            username,
-            house,
-            details,
-            error
+            event, uid, username, house, details, error
         ])
     except Exception as e:
-        logger.warning(f"LOG SKIPPED: {e}")
+        logger.warning(f"LOG ERROR: {e}")
 
+def find_user(uid):
+    for r in sheet_users.get_all_records():
+        if str(r.get("Telegram_ID")) == str(uid):
+            return r
+    return None
 
 def find_user_row(uid):
     ids = sheet_users.col_values(3)
@@ -110,13 +102,11 @@ def find_user_row(uid):
             return i
     return None
 
-
 def is_duplicate(file_uid):
     return file_uid in sheet_checks.col_values(13)
 
-
-def upload_to_drive(data: bytes, name: str, mime: str) -> str:
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+def upload_to_drive(data, name, mime):
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
     f = drive.files().create(
         body={"name": name, "parents": [DRIVE_FOLDER_ID]},
         media_body=media,
@@ -124,141 +114,100 @@ def upload_to_drive(data: bytes, name: str, mime: str) -> str:
     ).execute()
     return f"https://drive.google.com/uc?id={f['id']}"
 
-
-def download_qr_as_bytes(url: str) -> bytes:
+def download_qr_as_bytes(url):
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     return r.content
-
 
 # =====================================================
 # 🚀 START
 # =====================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
     uid = update.effective_user.id
+    user = find_user(uid)
 
-    menu = ADMIN_MENU if is_admin(uid) else USER_MENU
-
-    await update.message.reply_text(
-        "👋 *Добро пожаловать!*\n\n"
-        "Вы находитесь в официальном боте ТСН «Искона-Парк».\n\n"
-        "ℹ️ Здесь вы можете:\n"
-        "• получать уведомления о поселковых взносах\n"
-        "• загрузить чек об оплате\n"
-        "• посмотреть реквизиты для оплаты\n\n"
-        "Пожалуйста, используйте кнопки ниже 👇",
-        reply_markup=menu,
-        parse_mode="Markdown"
+    fio = user.get("ФИО") if user else None
+    greeting = (
+        f"Здравствуйте, *{fio}*!\n\n"
+        if fio else "Здравствуйте!\n\n"
     )
 
+    text = (
+        greeting +
+        "Вы находитесь в *официальном боте ТСН «Искона-Парк»*.\n\n"
+        "ℹ️ Здесь вы можете:\n"
+        "• получать уведомления о *поселковых взносах*\n"
+        "• загрузить чек об оплате\n"
+        "• посмотреть реквизиты для оплаты\n\n"
+        "Пожалуйста, используйте кнопки ниже 👇"
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
+    )
 
 # =====================================================
-# 📝 TEXT HANDLER (ВСЯ ЛОГИКА КНОПОК)
+# 📝 TEXT HANDLER
 # =====================================================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = update.message.text
     uid = update.effective_user.id
 
-    # ---------- START ----------
-    if text == "🚀 Начать":
+    if text == "/start":
         await start(update, context)
         return
 
-    # ---------- АДМИН-ПАНЕЛЬ ----------
     if text == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text(
-            "🛠 *Административная панель*\n\n"
-            "Выберите нужное действие:",
-            reply_markup=ADMIN_PANEL,
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Админ-панель:", reply_markup=ADMIN_PANEL)
         return
 
     if text == "⬅️ Назад":
         await update.message.reply_text(
-            "⬇️ Возврат в главное меню",
+            "Главное меню:",
             reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
         )
         return
 
-    # ---------- ДОЛГ ПО УЧАСТКУ ----------
-    if text == "🔍 Долг по участку" and is_admin(uid):
-        context.user_data["wait_house"] = True
+    if text == "💳 Реквизиты":
+        r = sheet_reqs.row_values(2)
         await update.message.reply_text(
-            "🏠 *Введите номер участка*\n\n"
-            "Я покажу:\n"
-            "• сумму долга\n"
-            "• телефон\n"
-            "• username\n"
-            "• статус бота",
+            f"💳 *Реквизиты для оплаты поселковых взносов*\n\n"
+            f"🏦 Банк: {r[0]}\n"
+            f"🔢 БИК: {r[1]}\n"
+            f"💼 Счёт: {r[2]}\n"
+            f"👤 Получатель: {r[3]}\n"
+            f"🧾 ИНН: {r[4]}",
+            parse_mode="Markdown"
+        )
+        if r[5]:
+            await update.message.reply_photo(download_qr_as_bytes(r[5]))
+        return
+
+    if text == "📎 Загрузить чек":
+        context.user_data["wait_check"] = True
+        await update.message.reply_text(
+            "📎 Отправьте *фото или PDF чека*.\n"
+            "После загрузки вы получите подтверждение.",
             parse_mode="Markdown"
         )
         return
 
-    if context.user_data.get("wait_house") and is_admin(uid):
-        context.user_data.pop("wait_house")
-
-        for r in sheet_users.get_all_records():
-            if str(r.get("Участок")) == text:
-                status_bot = "❌ Заблокировал бота" if not r.get("Telegram_ID") else "✅ Бот активен"
-
-                await update.message.reply_text(
-                    f"🏠 *Участок:* {text}\n"
-                    f"👤 *ФИО:* {r.get('ФИО')}\n"
-                    f"📱 *Телефон:* {r.get('Телефон')}\n"
-                    f"💰 *Задолженность:* {r.get('Сумма')} ₽\n"
-                    f"📎 *Username:* @{r.get('username')}\n"
-                    f"🤖 *Статус:* {status_bot}",
-                    parse_mode="Markdown",
-                    reply_markup=ADMIN_PANEL
-                )
-                return
-
+    if text == "📊 Статистика" and is_admin(uid):
+        logs = sheet_logs.get_all_records()
+        blocked = {r["Username"] for r in logs if r["Тип"] == "blocked"}
         await update.message.reply_text(
-            "❌ Участок не найден.",
-            reply_markup=ADMIN_PANEL
-        )
-        return
-
-    # ---------- РУЧНОЕ УВЕДОМЛЕНИЕ ----------
-    if text == "📣 Уведомление" and is_admin(uid):
-        context.user_data["notify_house"] = True
-        await update.message.reply_text(
-            "📣 *Введите номер участка*\n\n"
-            "Уведомление будет отправлено ТОЛЬКО этому участку.",
+            f"📊 *Статистика*\n\n"
+            f"👥 Пользователей: {len(sheet_users.get_all_records())}\n"
+            f"⛔️ Заблокировали бота: {len(blocked)}\n\n"
+            f"{', '.join(blocked) if blocked else '—'}",
             parse_mode="Markdown"
         )
         return
 
-    if context.user_data.get("notify_house") and is_admin(uid):
-        context.user_data.pop("notify_house")
-        sent = False
-
-        for r in sheet_users.get_all_records():
-            if str(r.get("Участок")) == text and r.get("Telegram_ID"):
-                try:
-                    await context.bot.send_message(
-                        int(r["Telegram_ID"]),
-                        "📣 *Уведомление ТСН «Искона-Парк»*\n\n"
-                        "Уважаемый(ая)!\n\n"
-                        "Просим Вас обратить внимание на информацию от Правления ТСН.\n\n"
-                        "С уважением,\n"
-                        "Правление ТСН",
-                        parse_mode="Markdown"
-                    )
-                    log_event("manual_notify", r["Telegram_ID"], r.get("username"), text)
-                    sent = True
-                except Exception as e:
-                    log_event("blocked", r.get("Telegram_ID"), r.get("username"), text, error=str(e))
-
-        await update.message.reply_text(
-            "✅ Уведомление отправлено." if sent else "❌ Не удалось отправить уведомление.",
-            reply_markup=ADMIN_PANEL
-        )
-        return
 # =====================================================
-# 📎 ЗАГРУЗКА ЧЕКОВ
+# 📎 FILE HANDLER
 # =====================================================
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("wait_check"):
@@ -267,178 +216,74 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     file = msg.photo[-1] if msg.photo else msg.document
 
-    # --- проверка на дубль ---
     if is_duplicate(file.file_unique_id):
-        await msg.reply_text(
-            "⚠️ *Этот чек уже был загружен ранее.*\n\n"
-            "Если это ошибка — обратитесь к администратору.",
-            parse_mode="Markdown"
-        )
-        log_event(
-            "duplicate_check",
-            update.effective_user.id,
-            update.effective_user.username,
-            details="Попытка загрузки дубля чека"
-        )
+        await msg.reply_text("⚠️ Этот чек уже был загружен.")
         context.user_data.clear()
         return
 
-    # --- скачивание ---
     tg_file = await file.get_file()
     data = await tg_file.download_as_bytearray()
 
-    # --- загрузка в Drive ---
     link = upload_to_drive(
         data,
         f"check_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         file.mime_type
     )
 
-    uid = update.effective_user.id
-    row = find_user_row(uid)
-
-    fio = house = phone = ""
-    if row:
-        fio = sheet_users.cell(row, 2).value
-        house = sheet_users.cell(row, 1).value
-        phone = sheet_users.cell(row, 5).value
+    user = find_user(update.effective_user.id)
 
     sheet_checks.append_row([
-        uid,
+        update.effective_user.id,
         update.effective_user.username or "",
-        fio,
-        house,
-        phone,
+        user.get("ФИО") if user else "",
+        user.get("Участок") if user else "",
+        user.get("Телефон") if user else "",
         link,
         "",
         datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        "",
-        "",
-        "",
-        "",
+        "", "", "", "",
         file.file_unique_id,
         "новый"
     ])
 
-    log_event(
-        "check_uploaded",
-        uid,
-        update.effective_user.username,
-        house,
-        details="Чек загружен"
-    )
-
     context.user_data.clear()
-    await msg.reply_text(
-        "✅ *Чек успешно принят!*\n\n"
-        "После проверки администратором задолженность будет закрыта.",
-        parse_mode="Markdown",
-        reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
-    )
-
+    await msg.reply_text("✅ Чек успешно загружен.")
 
 # =====================================================
-# 💳 РЕКВИЗИТЫ
-# =====================================================
-async def send_reqs(update: Update):
-    r = sheet_reqs.row_values(2)
-
-    await update.message.reply_text(
-        f"💳 *Реквизиты для оплаты поселковых взносов*\n\n"
-        f"🏦 Банк: {r[0]}\n"
-        f"🔢 БИК: {r[1]}\n"
-        f"💼 Счёт: {r[2]}\n"
-        f"👤 Получатель: {r[3]}\n"
-        f"🧾 ИНН: {r[4]}",
-        parse_mode="Markdown"
-    )
-
-    if r[5]:
-        qr_bytes = download_qr_as_bytes(r[5])
-        await update.message.reply_photo(qr_bytes)
-
-
-# =====================================================
-# ⏰ АВТО-УВЕДОМЛЕНИЯ (5 / 3 / 1 ДЕНЬ)
+# ⏰ УВЕДОМЛЕНИЯ 5 / 3 / 1
 # =====================================================
 async def monthly_notify(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ).date()
+    today = datetime.now(TZ).day
 
     for r in sheet_users.get_all_records():
         try:
             pay_day = int(r.get("День_оплаты") or 0)
             debt = float(str(r.get("Сумма") or "0").replace(",", "."))
 
-            if pay_day <= 0 or debt <= 0 or not r.get("Telegram_ID"):
+            if debt <= 0 or not r.get("Telegram_ID"):
                 continue
 
-            days_left = pay_day - today.day
+            days_left = pay_day - today
+            fio = r.get("ФИО")
 
-            if days_left == 5:
-                text = (
-                    "⏰ *Напоминание о поселковом взносе*\n\n"
-                    "Через 5 дней наступает срок оплаты.\n"
-                    "Пожалуйста, запланируйте оплату."
-                )
-            elif days_left == 3:
-                text = (
-                    "⚠️ *Важно!*\n\n"
-                    "До даты оплаты поселкового взноса осталось 3 дня.\n"
-                    "Просим произвести оплату своевременно."
-                )
-            elif days_left == 1:
-                text = (
-                    "❗️ *СРОЧНО*\n\n"
-                    "Завтра крайний срок оплаты поселкового взноса.\n"
-                    "Во избежание задолженности оплатите сегодня."
-                )
-            else:
-                continue
+            texts = {
+                5: f"⏰ Уважаемый(ая) *{fio}*,\n\n"
+                   f"Через 5 дней необходимо оплатить поселковые взносы.",
+                3: f"⚠️ Уважаемый(ая) *{fio}*,\n\n"
+                   f"До оплаты поселковых взносов осталось 3 дня.",
+                1: f"❗️ Уважаемый(ая) *{fio}*,\n\n"
+                   f"Завтра крайний срок оплаты поселковых взносов."
+            }
 
-            await context.bot.send_message(
-                int(r["Telegram_ID"]),
-                text,
-                parse_mode="Markdown"
-            )
-
-            log_event(
-                "auto_notify",
-                r["Telegram_ID"],
-                r.get("username"),
-                r.get("Участок"),
-                details=f"Уведомление за {days_left} день"
-            )
+            if days_left in texts:
+                await context.bot.send_message(
+                    int(r["Telegram_ID"]),
+                    texts[days_left],
+                    parse_mode="Markdown"
+                )
 
         except Exception as e:
-            log_event(
-                "blocked",
-                r.get("Telegram_ID"),
-                r.get("username"),
-                r.get("Участок"),
-                error=str(e)
-            )
-
-
-# =====================================================
-# 📊 СТАТИСТИКА
-# =====================================================
-async def send_stats(update: Update):
-    users = sheet_users.get_all_records()
-    total = len(users)
-
-    blocked = []
-    for r in sheet_logs.get_all_records():
-        if r.get("Тип") == "blocked":
-            blocked.append(str(r.get("Username")))
-
-    await update.message.reply_text(
-        "📊 *Статистика бота*\n\n"
-        f"👥 Всего пользователей: {total}\n"
-        f"⛔️ Заблокировали бота: {len(set(blocked))}\n\n"
-        f"⛔️ Список: {', '.join(set(blocked)) if blocked else '—'}",
-        parse_mode="Markdown"
-    )
-
+            log_event("blocked", r.get("Telegram_ID"), r.get("username"), error=str(e))
 
 # =====================================================
 # 🚦 MAIN
@@ -460,7 +305,6 @@ def main():
         port=int(os.getenv("PORT", 10000)),
         webhook_url="https://tsn-telegram-bot.onrender.com"
     )
-
 
 if __name__ == "__main__":
     main()
