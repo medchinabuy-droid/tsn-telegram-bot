@@ -308,3 +308,181 @@ def main():
 
 if __name__ == "__main__":
     main()
+# =====================================================
+# 📎 FILE HANDLER — ЗАГРУЗКА ЧЕКОВ
+# =====================================================
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("wait_check"):
+        return
+
+    msg = update.message
+    file = msg.photo[-1] if msg.photo else msg.document
+    uid = update.effective_user.id
+
+    # --- Проверка дубля ---
+    if is_duplicate(file.file_unique_id):
+        await msg.reply_text(
+            "⚠️ Этот чек уже был загружен ранее.\n"
+            "Если это ошибка — обратитесь к администратору."
+        )
+        log_event("duplicate_check", uid, update.effective_user.username)
+        context.user_data.clear()
+        return
+
+    # --- Скачать файл ---
+    tg_file = await file.get_file()
+    data = await tg_file.download_as_bytearray()
+
+    # --- Загрузка в Google Drive ---
+    link = upload_to_drive(
+        data,
+        f"check_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        file.mime_type
+    )
+
+    # --- Данные пользователя ---
+    row = find_user_row(uid)
+    fio = house = phone = ""
+    if row:
+        fio = sheet_users.cell(row, 2).value or ""
+        house = sheet_users.cell(row, 1).value or ""
+        phone = sheet_users.cell(row, 5).value or ""
+
+    # --- GPT-анализ чека (OCR / логика) ---
+    gpt_result = ask_gpt(
+        "Ты бухгалтер ТСН. Проанализируй чек оплаты поселковых взносов.",
+        "Чек загружен. Определи, корректен ли платёж."
+    )
+
+    status = "новый"
+    if "ошибка" in gpt_result.lower():
+        status = "отклонён"
+
+    # --- Запись в Лист 2 ---
+    sheet_checks.append_row([
+        uid,
+        update.effective_user.username or "",
+        fio,
+        house,
+        phone,
+        link,
+        "",
+        datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+        "",
+        gpt_result,
+        "",
+        file.file_unique_id,
+        status
+    ])
+
+    log_event("check_uploaded", uid, update.effective_user.username, house)
+
+    context.user_data.clear()
+    await msg.reply_text(
+        "✅ Чек принят и отправлен на проверку.\n"
+        "ℹ️ После подтверждения долг будет закрыт.",
+        reply_markup=ADMIN_MENU if is_admin(uid) else USER_MENU
+    )
+
+# =====================================================
+# ⏰ УВЕДОМЛЕНИЯ ЗА 5 / 3 / 1 ДЕНЬ
+# =====================================================
+async def monthly_notify(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TZ).date()
+
+    for r in sheet_users.get_all_records():
+        try:
+            pay_day = int(r.get("День_оплаты") or 0)
+            if pay_day <= 0:
+                continue
+
+            debt = float(str(r.get("Сумма") or "0").replace(",", "."))
+            if debt <= 0:
+                continue
+
+            delta = pay_day - today.day
+            if delta not in (5, 3, 1):
+                continue
+
+            uid = int(r["Telegram_ID"])
+            fio = r.get("ФИО")
+
+            tone = {
+                5: "ℹ️ Напоминаем",
+                3: "⚠️ Обращаем внимание",
+                1: "❗️Срочно"
+            }[delta]
+
+            await context.bot.send_message(
+                uid,
+                f"{tone}, {fio}!\n\n"
+                f"У вас есть задолженность по поселковым взносам.\n"
+                f"📅 До даты оплаты осталось {delta} дн.\n\n"
+                "💳 Оплатите и загрузите чек в бота."
+            )
+
+            log_event("auto_notify", uid, r.get("username"), r.get("Участок"))
+
+        except Exception as e:
+            log_event(
+                "blocked",
+                r.get("Telegram_ID"),
+                r.get("username"),
+                r.get("Участок"),
+                error=str(e)
+            )
+
+# =====================================================
+# 📊 GPT-МЕСЯЧНЫЙ ОТЧЁТ ПРЕДСЕДАТЕЛЮ
+# =====================================================
+async def monthly_gpt_report(context: ContextTypes.DEFAULT_TYPE):
+    users = sheet_users.get_all_records()
+    checks = sheet_checks.get_all_records()
+
+    summary = ask_gpt(
+        "Ты председатель ТСН. Сформируй официальный отчёт.",
+        f"""
+Всего жителей: {len(users)}
+Чеков загружено: {len(checks)}
+Должников: {len([u for u in users if float(str(u.get("Сумма") or "0").replace(",", ".")) > 0])}
+"""
+    )
+
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(
+            admin_id,
+            "📄 Месячный GPT-отчёт ТСН\n\n" + summary
+        )
+
+# =====================================================
+# 🚦 MAIN
+# =====================================================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # --- Уведомления каждый день в 18:00 ---
+    app.job_queue.run_daily(
+        monthly_notify,
+        time=time(hour=18, minute=0, tzinfo=TZ)
+    )
+
+    # --- GPT отчёт 1 числа ---
+    app.job_queue.run_monthly(
+        monthly_gpt_report,
+        when=time(hour=10, minute=0, tzinfo=TZ),
+        day=1
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        webhook_url="https://tsn-telegram-bot.onrender.com"
+    )
+
+if __name__ == "__main__":
+    main()
