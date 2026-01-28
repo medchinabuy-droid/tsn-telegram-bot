@@ -1,153 +1,110 @@
 import os
-import json
-import io
 import logging
-from datetime import datetime, timedelta, time
+import base64
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-import pytz
-import requests
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-
 from openai import OpenAI
 
-# =====================================================
-# 🔧 НАСТРОЙКИ
-# =====================================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-TZ = pytz.timezone("Europe/Moscow")
+# ================= НАСТРОЙКИ =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
+ADMIN_IDS = {123456789}  # <-- ID админов
+
+TZ = ZoneInfo("Europe/Moscow")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =====================================================
-# 📊 GOOGLE
-# =====================================================
-creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-creds = Credentials.from_service_account_info(
-    creds_info,
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ],
-)
+# ================= ХРАНИЛИЩЕ (ВРЕМЕННО) =================
+# В проде — БД или Google Sheets
 
-gc = gspread.authorize(creds)
-drive = build("drive", "v3", credentials=creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
-
-sheet_users = sh.worksheet("Лист 1")
-sheet_checks = sh.worksheet("Лист 2")
-sheet_logs = sh.worksheet("Лист 3")
-sheet_reqs = sh.worksheet("Реквизиты")
-
-# =====================================================
-# 🧭 МЕНЮ
-# =====================================================
-USER_MENU = ReplyKeyboardMarkup(
-    [["📎 Загрузить чек", "💳 Реквизиты"]],
-    resize_keyboard=True,
-)
-
-ADMIN_MENU = ReplyKeyboardMarkup(
-    [["📎 Загрузить чек", "💳 Реквизиты"], ["🧠 GPT панель"]],
-    resize_keyboard=True,
-)
-
-ADMIN_PANEL = ReplyKeyboardMarkup(
-    [["📊 GPT прогноз", "🧾 GPT анализ чека"], ["⬅️ Назад"]],
-    resize_keyboard=True,
-)
-
-# =====================================================
-# 🛠 УТИЛИТЫ
-# =====================================================
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+USERS = {}        # user_id -> dict
+CHECKS = []       # список чеков
+BLOCKED = set()   # заблокированные пользователи
 
 
-def log_event(event, uid="", username="", house="", details="", error=""):
-    try:
-        sheet_logs.append_row(
-            [
-                datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                event,
-                uid,
-                username,
-                house,
-                details,
-                error,
-            ]
-        )
-    except Exception as e:
-        logger.warning(f"LOG ERROR: {e}")
+# ================= УТИЛИТЫ =================
+
+def now():
+    return datetime.now(TZ)
 
 
-def find_user(uid):
-    rows = sheet_users.get_all_records()
-    for r in rows:
-        if str(r.get("Telegram_ID")) == str(uid):
-            return r
-    return None
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
-def upload_to_drive(data: bytes, name: str, mime: str) -> str:
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
-    f = (
-        drive.files()
-        .create(
-            body={"name": name, "parents": [DRIVE_FOLDER_ID]},
-            media_body=media,
-            fields="id",
-        )
-        .execute()
-    )
-    return f"https://drive.google.com/uc?id={f['id']}"
+def get_user(update: Update):
+    u = update.effective_user
+    return {
+        "id": u.id,
+        "username": u.username,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+    }
 
-# =====================================================
-# 🧠 GPT
-# =====================================================
-async def ask_gpt(system: str, user: str) -> str:
+
+def ensure_user(user):
+    if user["id"] not in USERS:
+        USERS[user["id"]] = {
+            "fio": f'{user["first_name"] or ""} {user["last_name"] or ""}'.strip(),
+            "phone": None,
+            "username": user["username"],
+            "debt": 0.0,
+            "blocked": False,
+            "created": now(),
+        }
+
+
+# ================= GPT =================
+
+async def gpt_text(prompt: str) -> str:
     resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": "Ты помощник ТСН. Отвечай кратко и по делу."},
+            {"role": "user", "content": prompt},
         ],
     )
     return resp.choices[0].message.content
 
 
-async def gpt_vision(image_bytes: bytes) -> str:
+async def gpt_vision(image_bytes: bytes, prompt: str) -> str:
+    image_b64 = base64.b64encode(image_bytes).decode()
+
     resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o",
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Распознай сумму и дату платежа"},
+                    {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_bytes.hex()}"},
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        },
                     },
                 ],
             }
@@ -155,170 +112,240 @@ async def gpt_vision(image_bytes: bytes) -> str:
     )
     return resp.choices[0].message.content
 
-# =====================================================
-# 🚀 START
-# =====================================================
+
+# ================= КОМАНДЫ =================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = find_user(uid)
+    user = get_user(update)
+    ensure_user(user)
 
-    fio = user["ФИО"] if user else "Уважаемый пользователь"
-
-    menu = ADMIN_MENU if is_admin(uid) else USER_MENU
-
-    await update.message.reply_text(
-        f"👋 Добро пожаловать, {fio}!\n\n"
-        "Вы находитесь в официальном боте ТСН «Искона-Парк».\n\n"
-        "ℹ️ Здесь вы можете:\n"
-        "• получать уведомления о поселковых взносах\n"
-        "• загрузить чек об оплате\n"
-        "• посмотреть реквизиты\n\n"
-        "Используйте кнопки ниже 👇",
-        reply_markup=menu,
-    )
-
-# =====================================================
-# 💳 РЕКВИЗИТЫ
-# =====================================================
-async def show_reqs(update: Update):
-    r = sheet_reqs.row_values(2)
+    if user["id"] in BLOCKED:
+        await update.message.reply_text("🚫 Вы заблокированы.")
+        return
 
     await update.message.reply_text(
-        f"💳 Реквизиты для оплаты\n\n"
-        f"🏦 Банк: {r[0]}\n"
-        f"🔢 БИК: {r[1]}\n"
-        f"💼 Счёт: {r[2]}\n"
-        f"👤 Получатель: {r[3]}\n"
-        f"🧾 ИНН: {r[4]}",
+        "👋 Добро пожаловать в бот ТСН\n\n"
+        "📸 Отправьте фото чека\n"
+        "📊 /debt — ваша задолженность"
     )
 
-    if r[5]:
-        await update.message.reply_photo(r[5])
 
-# =====================================================
-# 📎 ЧЕК
-# =====================================================
-async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = update.message.photo[-1]
-    tg_file = await file.get_file()
-    data = await tg_file.download_as_bytearray()
+async def debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update)
+    ensure_user(user)
 
-    link = upload_to_drive(
-        data,
-        f"check_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d_%H%M')}",
-        "image/jpeg",
-    )
-
-    sheet_checks.append_row(
-        [
-            update.effective_user.id,
-            update.effective_user.username,
-            "",
-            "",
-            "",
-            link,
-            "",
-            datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            "",
-            "",
-            "",
-            "",
-            file.file_unique_id,
-            "новый",
-        ]
-    )
-
+    data = USERS[user["id"]]
     await update.message.reply_text(
-        "✅ Чек принят.\n"
-        "🧠 Сейчас он будет проверен автоматически.",
-    )
-
-# =====================================================
-# 🧠 GPT АДМИН
-# =====================================================
-async def gpt_panel(update: Update):
-    await update.message.reply_text(
-        "🧠 GPT панель администратора",
-        reply_markup=ADMIN_PANEL,
+        f"💸 Ваша задолженность: {data['debt']} ₽"
     )
 
 
-async def gpt_forecast(update: Update):
-    debts = [
-        f"{r['Участок']} — {r['Сумма']}₽"
-        for r in sheet_users.get_all_records()
-        if float(str(r.get("Сумма") or 0).replace(",", ".")) > 0
+# ================= ЧЕКИ =================
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update)
+    ensure_user(user)
+
+    if user["id"] in BLOCKED:
+        return
+
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    image_bytes = await file.download_as_bytearray()
+
+    prompt = (
+        "Это фото чека. "
+        "Определи сумму платежа в рублях. "
+        "Ответь строго числом. Если не чек — напиши NO."
+    )
+
+    try:
+        result = await gpt_vision(image_bytes, prompt)
+    except Exception as e:
+        logger.exception(e)
+        await update.message.reply_text("❌ Ошибка обработки чека.")
+        return
+
+    if "NO" in result.upper():
+        await reject_check(user["id"], "Не чек")
+        await update.message.reply_text("❌ Это не чек.")
+        return
+
+    try:
+        amount = float(result.replace(",", "."))
+    except ValueError:
+        await reject_check(user["id"], "Не распознана сумма")
+        await update.message.reply_text("❌ Не удалось распознать сумму.")
+        return
+
+    CHECKS.append({
+        "user_id": user["id"],
+        "amount": amount,
+        "date": now(),
+        "status": "accepted",
+    })
+
+    USERS[user["id"]]["debt"] -= amount
+
+    await update.message.reply_text(f"✅ Чек принят. Сумма: {amount} ₽")
+
+
+async def reject_check(user_id: int, reason: str):
+    CHECKS.append({
+        "user_id": user_id,
+        "amount": 0,
+        "date": now(),
+        "status": "rejected",
+        "reason": reason,
+    })
+
+    # авто-блок при 3 отказах
+    rejected = [
+        c for c in CHECKS
+        if c["user_id"] == user_id and c["status"] == "rejected"
     ]
 
-    text = "\n".join(debts) or "Нет задолженностей"
+    if len(rejected) >= 3:
+        BLOCKED.add(user_id)
+        USERS[user_id]["blocked"] = True
 
-    report = await ask_gpt(
-        "Ты финансовый аналитик ТСН. Спрогнозируй задолженности.",
-        text,
+
+# ================= GPT АДМИН =================
+
+async def gpt_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    prompt = "Сформируй краткий отчёт по задолженностям ТСН."
+    text = await gpt_text(prompt)
+
+    await update.message.reply_text(text)
+
+
+# ================= ПРОГНОЗ =================
+
+async def gpt_forecast(context: ContextTypes.DEFAULT_TYPE):
+    total_debt = sum(u["debt"] for u in USERS.values())
+
+    prompt = (
+        f"Общая задолженность ТСН: {total_debt} ₽. "
+        "Спрогнозируй ситуацию на следующий месяц."
     )
 
-    await update.message.reply_text(report)
+    text = await gpt_text(prompt)
 
-# =====================================================
-# ⏰ АВТО-УВЕДОМЛЕНИЯ
-# =====================================================
-async def auto_notify(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ).day
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(admin_id, f"📈 Прогноз:\n{text}")
+# ================= УВЕДОМЛЕНИЯ =================
 
-    for r in sheet_users.get_all_records():
-        try:
-            pay_day = int(r.get("День_оплаты") or 0)
-            if not (pay_day - 5 <= today <= pay_day):
-                continue
+async def remind_debt(context: ContextTypes.DEFAULT_TYPE):
+    for user_id, data in USERS.items():
+        if data["debt"] > 0 and not data["blocked"]:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"🔔 Напоминание\n\n"
+                        f"У вас задолженность: {data['debt']} ₽\n"
+                        f"Пожалуйста, оплатите взнос."
+                    )
+                )
+            except Exception:
+                pass
 
-            uid = int(r["Telegram_ID"])
-            fio = r.get("ФИО")
 
-            await context.bot.send_message(
-                uid,
-                f"⏰ Напоминание об оплате\n\n"
-                f"{fio}, напоминаем о необходимости оплатить поселковый взнос.\n"
-                "Пожалуйста, произведите оплату и загрузите чек.",
-            )
-        except Exception as e:
-            log_event("notify_error", error=str(e))
+# ================= МЕСЯЧНЫЙ ОТЧЁТ =================
 
-# =====================================================
-# 📩 HANDLER
-# =====================================================
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def monthly_report(context: ContextTypes.DEFAULT_TYPE):
+    total_debt = sum(u["debt"] for u in USERS.values())
+    total_users = len(USERS)
+    blocked = len(BLOCKED)
 
-    if text == "💳 Реквизиты":
-        await show_reqs(update)
-    elif text == "🧠 GPT панель" and is_admin(update.effective_user.id):
-        await gpt_panel(update)
-    elif text == "📊 GPT прогноз" and is_admin(update.effective_user.id):
-        await gpt_forecast(update)
-    elif text == "⬅️ Назад":
-        await start(update, context)
+    prompt = (
+        "Сформируй официальный отчёт председателю ТСН.\n\n"
+        f"Всего пользователей: {total_users}\n"
+        f"Общая задолженность: {total_debt} ₽\n"
+        f"Заблокировано пользователей: {blocked}\n\n"
+        "Сделай выводы и рекомендации."
+    )
 
-# =====================================================
-# 🚦 MAIN
-# =====================================================
+    report = await gpt_text(prompt)
+
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(
+            admin_id,
+            f"📊 МЕСЯЧНЫЙ ОТЧЁТ ТСН\n\n{report}"
+        )
+
+
+# ================= АДМИН ПАНЕЛЬ =================
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    text = (
+        "🛠 АДМИН ПАНЕЛЬ\n\n"
+        f"👥 Пользователей: {len(USERS)}\n"
+        f"🚫 Заблокировано: {len(BLOCKED)}\n"
+        f"💸 Общая задолженность: {sum(u['debt'] for u in USERS.values())} ₽\n\n"
+        "/gpt_report — GPT отчёт\n"
+        "/users — список пользователей"
+    )
+
+    await update.message.reply_text(text)
+
+
+async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    lines = []
+    for uid, u in USERS.items():
+        lines.append(
+            f"{u['fio']} | @{u['username']} | {u['debt']} ₽ | "
+            f"{'🚫' if u['blocked'] else '✅'}"
+        )
+
+    text = "👥 Пользователи:\n\n" + "\n".join(lines)
+    await update.message.reply_text(text[:4000])
+
+
+# ================= ЗАПУСК =================
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(MessageHandler(filters.PHOTO, upload_check))
+    # команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("debt", debt))
 
-    # ✅ авто-уведомления каждый день в 18:00
-    app.job_queue.run_daily(
-        auto_notify,
-        time=time(hour=18, minute=0, tzinfo=TZ),
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("users", users_list))
+    application.add_handler(CommandHandler("gpt_report", gpt_admin))
+
+    # фото чеков
+    application.add_handler(
+        MessageHandler(filters.PHOTO, handle_photo)
     )
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        webhook_url=os.getenv("WEBHOOK_URL"),
+    # JOB QUEUE
+    jq = application.job_queue
+
+    jq.run_daily(
+        remind_debt,
+        time=datetime.strptime("10:00", "%H:%M").time(),
+        name="debt_reminder"
     )
+
+    jq.run_monthly(
+        monthly_report,
+        when=1,
+        time=datetime.strptime("12:00", "%H:%M").time(),
+        name="monthly_report"
+    )
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
