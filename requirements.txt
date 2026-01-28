@@ -1,5 +1,6 @@
-python-telegram-bot[job-queue,webhooks]==21.6
-aiohttp==3.9.5
-gspread==6.1.2
-google-auth==2.29.0
-google-api-python-client==2.160.0
+python-telegram-bot==21.6
+openai>=1.10.0
+aiohttp
+pytesseract
+Pillow
+apscheduler
