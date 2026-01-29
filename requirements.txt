@@ -1,7 +1,8 @@
-python-telegram-bot[job-queue]==21.6
-openai==2.16.0
-asyncpg==0.30.0
-reportlab==4.1.0
-openpyxl==3.1.5
-gspread==6.2.1
-google-auth==2.48.0
+python-telegram-bot[webhooks,job-queue]==21.6
+asyncpg
+gspread
+google-auth
+openai
+python-dotenv
+reportlab
+openpyxl
