@@ -1,12 +1,12 @@
 import os
 import json
 import logging
-import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from io import BytesIO
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, FileResponse
 import uvicorn
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -14,13 +14,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 import gspread
 from google.oauth2.service_account import Credentials
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
-from google.cloud import vision
-import qrcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 # ---------------- CONFIG ----------------
 
@@ -29,7 +28,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", 1000))
@@ -41,21 +39,12 @@ logger = logging.getLogger("tsn-bot")
 # ---------------- GOOGLE ----------------
 
 creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CREDS = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 GC = gspread.authorize(CREDS)
 SPREAD = GC.open_by_key(SPREADSHEET_ID)
 
 SHEET_USERS = SPREAD.worksheet("Лист 1")
-SHEET_CHECKS = SPREAD.worksheet("Лист 2")
-SHEET_LOGS = SPREAD.worksheet("Лист 3")
-SHEET_REKV = SPREAD.worksheet("Реквизиты")
-
-drive_service = build("drive", "v3", credentials=CREDS)
-
-vision_creds = service_account.Credentials.from_service_account_info(creds_dict)
-vision_client = vision.ImageAnnotatorClient(credentials=vision_creds)
 
 # ---------------- BOT + FASTAPI ----------------
 
@@ -79,59 +68,134 @@ def find_user(uid=None, username=None):
             return i, u
     return None, None
 
-def ocr_receipt(image_bytes: bytes):
-    image = vision.Image(content=image_bytes)
-    response = vision_client.text_detection(image=image)
-    text = response.text_annotations[0].description if response.text_annotations else ""
-    return text
-
-def parse_sum(text: str):
-    m = re.search(r"(\d+[.,]\d{2})", text.replace(",", "."))
-    return m.group(1) if m else None
-
-def parse_date(text: str):
-    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-    return m.group(1) if m else None
+def parse_date_ddmmyyyy(s):
+    try:
+        return datetime.strptime(s, "%d.%m.%Y").date()
+    except:
+        return None
 
 # ---------------- UI ----------------
 
 def main_keyboard(is_admin=False):
-    kb = [["💳 Реквизиты", "📊 Статус"], ["ℹ️ Информация"]]
+    kb = [["📊 Статус", "ℹ️ Информация"]]
     if is_admin:
-        kb.append(["🛠 Админ", "📈 Статистика"])
+        kb.append(["📈 Статистика", "📄 PDF отчёт"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 # ---------------- HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    _, u = find_user(uid=user.id, username=user.username)
-    if not u:
-        await update.message.reply_text("Вы не зарегистрированы. Обратитесь к администратору.")
-        return
-    await update.message.reply_text("Добро пожаловать!", reply_markup=main_keyboard(is_admin(user.id)))
+    await update.message.reply_text("Добро пожаловать в ТСН ИСКОНА ПАРК 🌿", reply_markup=main_keyboard(is_admin(update.effective_user.id)))
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, u = find_user(uid=update.effective_user.id, username=update.effective_user.username)
     if not u:
+        await update.message.reply_text("Вы не привязаны.")
         return
     await update.message.reply_text(f"Ваш статус: {u.get('Статус')}")
-
-async def rekv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    r = SHEET_REKV.get_all_records()[0]
-    text = f"{r['Получатель']}\n{r['Счёт получателя']}\n{r['Банк']}\n{r['Назначение платежа']}"
-    qr = qrcode.make(text)
-    bio = BytesIO()
-    qr.save(bio, format="PNG")
-    bio.seek(0)
-    await update.message.reply_photo(bio, caption=text)
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = get_all_users()
     debtors = [u for u in users if str(u.get("Статус")).lower() == "долг"]
     await update.message.reply_text(
-        f"Всего: {len(users)}\nДолжники: {len(debtors)}\nПлатят: {len(users)-len(debtors)}"
+        f"📈 Статистика:\n\n"
+        f"Всего: {len(users)}\n"
+        f"Должники: {len(debtors)}\n"
+        f"Платят вовремя: {len(users) - len(debtors)}"
     )
+
+async def admin_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = get_all_users()
+    file_path = "/mnt/data/report.pdf"
+
+    doc = SimpleDocTemplate(file_path)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Отчёт по задолженностям ТСН ИСКОНА ПАРК", styles["Title"]), Spacer(1, 12)]
+
+    table_data = [["Участок", "ФИО", "Статус", "Сумма"]]
+    for u in users:
+        table_data.append([u.get("Участок"), u.get("ФИО"), u.get("Статус"), u.get("Сумма")])
+
+    table = Table(table_data)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+    ]))
+
+    story.append(table)
+    doc.build(story)
+
+    await update.message.reply_document(document=open(file_path, "rb"), filename="report.pdf")
+
+# ---------------- NOTIFICATIONS ----------------
+
+async def payment_notifications():
+    today = date.today()
+    users = get_all_users()
+
+    for u in users:
+        uid = u.get("Telegram_ID")
+        pay_day = u.get("День_оплаты")
+        if not uid or not pay_day:
+            continue
+
+        try:
+            pay_day = int(pay_day)
+            pay_date = date(today.year, today.month, pay_day)
+        except:
+            continue
+
+        delta = (pay_date - today).days
+
+        if delta in (5, 3, 1):
+            msg = "🔔 Напоминание: скоро день оплаты взноса. Благодарим за своевременную оплату 🙏"
+        elif delta < 0 and str(u.get("Статус")).lower() == "долг":
+            msg = "⚠️ У вас задолженность по взносам. Просим срочно погасить долг."
+        else:
+            continue
+
+        try:
+            await application.bot.send_message(chat_id=int(uid), text=msg)
+        except Exception as e:
+            logger.error(e)
+
+async def birthday_notifications():
+    today = date.today()
+    users = get_all_users()
+
+    for u in users:
+        uid = u.get("Telegram_ID")
+        bday = parse_date_ddmmyyyy(u.get("Дата_рождения", ""))
+        if not uid or not bday:
+            continue
+
+        if bday.day == today.day and bday.month == today.month:
+            msg = "🎉 Поздравляем с Днём Рождения! 🎂\nЖелаем здоровья, благополучия и отличного настроения!\n\nС уважением, правление ТСН ИСКОНА ПАРК 🌿"
+            try:
+                await application.bot.send_message(chat_id=int(uid), text=msg)
+            except Exception as e:
+                logger.error(e)
+
+# ---------------- DASHBOARD ----------------
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    users = get_all_users()
+    total = len(users)
+    debtors = len([u for u in users if str(u.get("Статус")).lower() == "долг"])
+
+    html = f"""
+    <html>
+    <head><title>ТСН ИСКОНА ПАРК — Дашборд</title></head>
+    <body>
+        <h1>Дашборд ТСН ИСКОНА ПАРК</h1>
+        <p>Всего собственников: {total}</p>
+        <p>Должники: {debtors}</p>
+        <p>Оплачивают вовремя: {total - debtors}</p>
+    </body>
+    </html>
+    """
+    return html
 
 # ---------------- ROUTER ----------------
 
@@ -139,10 +203,10 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
     if t == "📊 Статус":
         await status(update, context)
-    elif t == "💳 Реквизиты":
-        await rekv(update, context)
     elif t == "📈 Статистика":
         await admin_stats(update, context)
+    elif t == "📄 PDF отчёт":
+        await admin_pdf(update, context)
     else:
         await start(update, context)
 
@@ -164,7 +228,11 @@ async def on_startup():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
     await application.start()
     await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}")
+
+    scheduler.add_job(payment_notifications, "cron", hour=10)
+    scheduler.add_job(birthday_notifications, "cron", hour=9)
     scheduler.start()
+
     logger.info("🚀 Бот запущен")
 
 @app.on_event("shutdown")
