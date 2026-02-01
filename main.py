@@ -39,7 +39,6 @@ from tzlocal import get_localzone_name
 
 import openai
 from PIL import Image
-import matplotlib.pyplot as plt
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
