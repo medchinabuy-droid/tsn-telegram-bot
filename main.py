@@ -1,415 +1,254 @@
 import os
 import json
 import logging
-import hashlib
-import asyncio
-from datetime import datetime, timedelta, time
 from io import BytesIO
-from typing import Optional, Dict
+from datetime import datetime, date, timedelta
 
-from dotenv import load_dotenv
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 import uvicorn
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InputFile,
-)
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputFile
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
 import gspread
 from google.oauth2.service_account import Credentials
-import qrcode
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from google.cloud import vision_v1 as vision  # ✅ фикс импорта
 
-import openai
-from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
-# -------------------- CONFIG --------------------
+# ---------------- CONFIG ----------------
 
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = set(map(int, filter(None, os.getenv("ADMIN_IDS", "").split(","))))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://tsn-telegram-bot.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
-PORT = int(os.getenv("PORT", "8000"))
-
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-MONTHLY_FEE_DEFAULT = int(os.getenv("MONTHLY_FEE", "6000"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-openai.api_key = OPENAI_API_KEY
+PORT = int(os.getenv("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tsn-bot")
+logger = logging.getLogger(__name__)
 
-# -------------------- FASTAPI --------------------
+# ---------------- GOOGLE CREDS ----------------
+
+creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(SPREADSHEET_ID)
+SHEET_USERS = sheet.worksheet("Лист 1")
+SHEET_CHECKS = sheet.worksheet("Лист 2")
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/google_creds.json"
+with open("/tmp/google_creds.json", "w") as f:
+    json.dump(creds_dict, f)
+
+vision_client = vision.ImageAnnotatorClient()
+
+# ---------------- FASTAPI + TG ----------------
 
 app = FastAPI()
-telegram_app: Optional[Application] = None
+application = Application.builder().token(BOT_TOKEN).build()
 scheduler = AsyncIOScheduler()
 
-# -------------------- GOOGLE SHEETS INIT --------------------
+# ---------------- UI ----------------
 
-GC = None
-SHEET_USERS = None
-SHEET_CHECKS = None
-SHEET_LOGS = None
+def main_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("ℹ️ Информация о взносах")],
+        [KeyboardButton("📤 Загрузить чек")]
+    ], resize_keyboard=True)
 
-def init_google():
-    global GC, SHEET_USERS, SHEET_CHECKS, SHEET_LOGS
+INFO_TEXT = """ℹ️ Информация о взносах:
+
+• Взнос ежемесячный 6000 руб.
+• Сумма может отличаться при наличии льгот
+• День оплаты указан индивидуально
+• Чеки проверяются автоматически
+• При просрочке формируется задолженность
+
+📧 Контакты для пропусков: propusk@tsn-iskona-park.ru
+📧 Связь с ТСН: info@iskonapark.ru
+"""
+
+# ---------------- HELPERS ----------------
+
+def parse_date_ddmmyyyy(s):
     try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        GC = gspread.authorize(creds)
-        sh = GC.open_by_key(SPREADSHEET_ID)
-
-        SHEET_USERS = sh.worksheet("Лист 1")
-        SHEET_CHECKS = sh.worksheet("Лист 2")
-        SHEET_LOGS = sh.worksheet("Лист 3")
-
-        logger.info("✅ Google Sheets инициализированы")
-    except Exception as e:
-        logger.exception("❌ Ошибка инициализации Google Sheets: %s", e)
-        GC = None
-
-# -------------------- HELPERS --------------------
-
-def log_event(event_type, uid=None, username=None, plot=None, details="", error=""):
-    if not SHEET_LOGS:
-        return
-    try:
-        SHEET_LOGS.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            event_type,
-            uid,
-            username,
-            plot,
-            details,
-            error
-        ])
-    except Exception as e:
-        logger.error("Log error: %s", e)
-
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+        return datetime.strptime(s, "%d.%m.%Y").date()
+    except:
+        return None
 
 def get_all_users():
-    if not SHEET_USERS:
-        return []
-    return SHEET_USERS.get_all_records()
+    rows = SHEET_USERS.get_all_records()
+    return rows
 
-def find_user_by_tg(uid: int):
-    if not SHEET_USERS:
-        return None, None
-    users = SHEET_USERS.get_all_records()
-    for idx, u in enumerate(users, start=2):
-        if str(u.get("Telegram_ID")) == str(uid):
-            return idx, u
+def find_user(uid=None, username=None):
+    users = get_all_users()
+    for i, u in enumerate(users, start=2):
+        if uid and str(u.get("Telegram_ID")) == str(uid):
+            return i, u
+    for i, u in enumerate(users, start=2):
+        if username and str(u.get("username")).lower() == str(username).lower():
+            return i, u
     return None, None
 
-def register_user_if_not_exists(update: Update):
-    uid = update.effective_user.id
-    username = update.effective_user.username or ""
-    row, user = find_user_by_tg(uid)
-    if user:
-        return row, user
+def ocr_check(image_bytes: bytes) -> str:
+    image = vision.Image(content=image_bytes)
+    response = vision_client.text_detection(image=image)
+    texts = response.text_annotations
+    return texts[0].description if texts else ""
 
-    # минимальная регистрация
-    SHEET_USERS.append_row([
-        "",  # Участок
-        f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip(),
-        uid,
-        username,
-        "",  # Телефон
-        25,  # День_оплаты (дефолт)
-        "",  # Электро
-        MONTHLY_FEE_DEFAULT,  # Сумма
-        "",  # Дата
-        "новый",  # Статус
-        "user",  # Роль
-        "",  # Дата_напоминания
-    ])
-    log_event("register", uid=uid, username=username)
-    return find_user_by_tg(uid)
-
-def generate_qr(text: str) -> BytesIO:
-    qr = qrcode.make(text)
-    bio = BytesIO()
-    qr.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
-
-def hash_image_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-# -------------------- OCR / GPT (заглушки с логикой) --------------------
-
-async def ocr_extract_stub(image_bytes: bytes) -> Dict:
-    # TODO: заменить на Vision API
-    return {
-        "date": None,
-        "amount": None,
-        "raw_text": ""
-    }
-
-async def gpt_validate_stub(text: str) -> bool:
-    # TODO: заменить на реальный GPT-анализ
-    return True
-
-# -------------------- BOT HANDLERS --------------------
+# ---------------- HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    row, user = register_user_if_not_exists(update)
-
-    kb = [
-        ["💳 Реквизиты", "📊 Статус"],
-        ["📸 Загрузить чек", "ℹ️ Информация"],
-    ]
-    if is_admin(uid):
-        kb.append(["🛠 Админ панель"])
-
     await update.message.reply_text(
-        f"👋 Здравствуйте!\n"
-        f"Вы зарегистрированы в системе поселковых взносов.\n\n"
-        f"ФИО: {user.get('ФИО')}\n"
-        f"Участок: {user.get('Участок') or 'не указан'}",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+        "Добро пожаловать в бот ТСН «Искона Парк» 👋\nВыберите действие:",
+        reply_markup=main_keyboard()
     )
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ Информация о взносах:\n\n"
-        "• Взнос ежемесячный\n"
-        "• Сумма может отличаться при наличии льгот\n"
-        "• День оплаты указан индивидуально\n"
-        "• Чеки проверяются автоматически\n"
-        "• При просрочке формируется задолженность"
-    )
+    await update.message.reply_text(INFO_TEXT)
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row, user = find_user_by_tg(update.effective_user.id)
-    if not user:
+async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row, u = find_user(uid=user.id, username=user.username)
+    if not u:
+        await update.message.reply_text("Вы не найдены в реестре. Обратитесь в правление.")
         return
-    await update.message.reply_text(
-        f"📊 Ваш статус:\n\n"
-        f"Участок: {user.get('Участок')}\n"
-        f"Сумма: {user.get('Сумма')}\n"
-        f"День оплаты: {user.get('День_оплаты')}\n"
-        f"Статус: {user.get('Статус')}"
-    )
 
-async def rekv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Получатель: ТСН\n"
-        "ИНН: 0000000000\n"
-        "Счёт: 0000000000000000\n"
-        "Банк: Банк\n"
-        "БИК: 000000000"
-    )
-    qr = generate_qr(text)
-    await update.message.reply_photo(InputFile(qr), caption=text)
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    bio = BytesIO()
+    await file.download_to_memory(out=bio)
+    bio.seek(0)
 
-async def ask_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Пришлите фото чека для загрузки и проверки.")
+    text = ocr_check(bio.getvalue())
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    file = await update.message.photo[-1].get_file()
-    b = await file.download_as_bytearray()
+    amount = None
+    check_date = None
 
-    file_unique_id = update.message.photo[-1].file_unique_id
-    img_hash = hash_image_bytes(bytes(b))
-
-    # Проверка дубля
-    if SHEET_CHECKS:
-        rows = SHEET_CHECKS.get_all_records()
-        for r in rows:
-            if r.get("File_Unique_ID") == file_unique_id or r.get("Дубль_чека") == img_hash:
-                await update.message.reply_text("⚠️ Этот чек уже был загружен ранее.")
-                log_event("duplicate_check", uid=uid)
-                return
-
-    ocr = await ocr_extract_stub(bytes(b))
-    ok = await gpt_validate_stub(ocr.get("raw_text", ""))
+    for t in text.replace(",", ".").split():
+        if t.replace(".", "").isdigit() and len(t) > 3:
+            amount = t
+        d = parse_date_ddmmyyyy(t)
+        if d:
+            check_date = d.strftime("%d.%m.%Y")
 
     SHEET_CHECKS.append_row([
-        uid,
-        update.effective_user.username or "",
-        update.effective_user.full_name,
-        "",  # Дом
-        "",  # Телефон
-        file.file_path,
-        "",  # Сумма_по_чеку
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "",  # Дата_чека
-        ocr.get("date"),
-        ocr.get("raw_text"),
-        img_hash,
-        file_unique_id,
-        "auto_ok" if ok else "need_review"
+        user.id, user.username, u.get("ФИО"), u.get("Дом"), u.get("Телефон"),
+        "", amount, datetime.now().strftime("%d.%m.%Y %H:%M"),
+        check_date, check_date, text[:500], "", photo.file_id, "оплачено"
     ])
 
-    await update.message.reply_text("✅ Чек принят. Он будет проверен автоматически.")
-
-# -------------------- ADMIN --------------------
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    kb = [
-        ["📣 Напоминание по участку"],
-        ["⬅️ Назад"],
-    ]
     await update.message.reply_text(
-        "🛠 Админ панель",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+        f"✅ Чек принят автоматически.\n"
+        f"💳 Сумма: {amount}\n"
+        f"📅 Дата: {check_date}"
     )
 
-async def admin_remind_plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["wait_plot"] = True
-    await update.message.reply_text("Введите номер участка:")
+# ---------------- JOBS ----------------
 
-async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("wait_plot"):
-        plot = update.message.text.strip()
-        sent = 0
-        for u in get_all_users():
-            if str(u.get("Участок")) == plot and u.get("Telegram_ID"):
-                try:
-                    await context.bot.send_message(
-                        int(u["Telegram_ID"]),
-                        f"🔔 Напоминание об оплате.\nУчасток: {plot}"
-                    )
-                    sent += 1
-                except Exception as e:
-                    logger.error("Send error: %s", e)
-        context.user_data.clear()
-        await update.message.reply_text(f"✅ Отправлено: {sent}")
-# -------------------- REMINDERS --------------------
+async def reminders_job():
+    today = date.today()
+    for u in get_all_users():
+        uid = u.get("Telegram_ID")
+        pay_day = parse_date_ddmmyyyy(u.get("День_оплаты", ""))
+        status = str(u.get("Статус", "")).lower()
 
-async def payment_reminder_job():
-    users = get_all_users()
-    today = datetime.now().day
+        if not pay_day:
+            continue
 
-    for idx, u in enumerate(users, start=2):
+        delta = (pay_day - today).days
+
+        if delta in [5, 3, 1]:
+            msg = f"🔔 Напоминание: через {delta} дн. день оплаты взноса."
+        elif delta < 0 and status != "оплачено":
+            msg = "⚠️ У вас задолженность по взносам. Просим срочно оплатить."
+        else:
+            continue
+
         try:
-            uid = u.get("Telegram_ID")
-            if not uid:
-                continue
-
-            pay_day = int(u.get("День_оплаты", 0) or 0)
-            delta = pay_day - today
-
-            if delta in (5, 3, 1):
-                text = (
-                    f"👋 {u.get('ФИО')},\n"
-                    f"Напоминаем об оплате поселковых взносов. "
-                    f"День оплаты: {pay_day}."
-                )
-            elif delta < 0:
-                text = (
-                    f"⚠️ {u.get('ФИО')},\n"
-                    f"У вас образовалась задолженность. "
-                    f"Просьба погасить задолженность."
-                )
-            else:
-                continue
-
-            await telegram_app.bot.send_message(int(uid), text)
-            if SHEET_USERS:
-                SHEET_USERS.update_cell(idx, 12, datetime.now().strftime("%Y-%m-%d"))
-
+            if uid:
+                await application.bot.send_message(int(uid), msg)
         except Exception as e:
-            log_event("reminder_error", error=str(e))
+            logger.error(e)
 
-# -------------------- ROUTER --------------------
+async def birthday_job():
+    today = date.today().strftime("%d.%m")
+    for u in get_all_users():
+        dr = u.get("Дата_рождения")
+        if dr and dr.startswith(today):
+            uid = u.get("Telegram_ID")
+            try:
+                await application.bot.send_message(
+                    int(uid),
+                    "🎉 Поздравляем с Днём Рождения! Желаем здоровья и благополучия! С уважением, правление ТСН 🌿"
+                )
+            except:
+                pass
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+# ---------------- WEB ----------------
 
-    if text == "ℹ️ Информация":
-        await info(update, context)
-    elif text == "📊 Статус":
-        await status(update, context)
-    elif text == "💳 Реквизиты":
-        await rekv(update, context)
-    elif text == "📸 Загрузить чек":
-        await ask_check(update, context)
-    elif text == "🛠 Админ панель":
-        await admin_panel(update, context)
-    elif text == "📣 Напоминание по участку":
-        await admin_remind_plot(update, context)
-    elif text == "⬅️ Назад":
-        await start(update, context)
-    else:
-        await handle_admin_text(update, context)
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    users = get_all_users()
+    total = len(users)
+    debtors = sum(1 for u in users if str(u.get("Статус")).lower() == "долг")
 
-# -------------------- FASTAPI WEBHOOK --------------------
+    return f"""
+    <html>
+    <head><title>ТСН Дашборд</title></head>
+    <body style="font-family:Arial;">
+        <h1>ТСН «Искона Парк»</h1>
+        <p>Всего участков: {total}</p>
+        <p>Должников: {debtors}</p>
+        <p>Оплатили: {total - debtors}</p>
+    </body>
+    </html>
+    """
+
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
+async def webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
+
+# ---------------- STARTUP ----------------
 
 @app.on_event("startup")
-async def on_startup():
-    global telegram_app
+async def startup():
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^ℹ️"), info))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_check))
 
-    init_google()
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}")
 
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    await telegram_app.initialize()
-    await telegram_app.start()
-
-    webhook_full_url = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
-    await telegram_app.bot.set_webhook(webhook_full_url)
-
-    scheduler.add_job(payment_reminder_job, "cron", hour=9, minute=0)
+    scheduler.add_job(reminders_job, "cron", hour=10)
+    scheduler.add_job(birthday_job, "cron", hour=9)
     scheduler.start()
 
-    logger.info("🚀 Бот запущен, webhook установлен: %s", webhook_full_url)
+    logger.info("🚀 TSN BOT ЗАПУЩЕН")
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    if telegram_app:
-        await telegram_app.stop()
-        await telegram_app.shutdown()
-    scheduler.shutdown()
+async def shutdown():
+    await application.stop()
+    await application.shutdown()
 
-@app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return PlainTextResponse("OK")
-
-@app.get("/")
-async def health():
-    return PlainTextResponse("OK")
-
-# -------------------- RUN --------------------
+# ---------------- MAIN ----------------
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
