@@ -2,11 +2,10 @@ import os
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 from dotenv import load_dotenv
-
 from fastapi import FastAPI, Request
 import uvicorn
 
@@ -15,14 +14,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from google.cloud import vision
 
+from google.cloud import vision
 import qrcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# -------------------- CONFIG --------------------
+# ---------------- CONFIG ----------------
 
 load_dotenv()
 
@@ -38,15 +38,11 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tsn-bot")
 
-# -------------------- GOOGLE --------------------
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/cloud-vision"
-]
+# ---------------- GOOGLE ----------------
 
 creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
 CREDS = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 GC = gspread.authorize(CREDS)
 SPREAD = GC.open_by_key(SPREADSHEET_ID)
@@ -57,78 +53,31 @@ SHEET_LOGS = SPREAD.worksheet("Лист 3")
 SHEET_REKV = SPREAD.worksheet("Реквизиты")
 
 drive_service = build("drive", "v3", credentials=CREDS)
-vision_client = vision.ImageAnnotatorClient(credentials=CREDS)
 
-logger.info("✅ Google Sheets + Drive + Vision инициализированы")
+vision_creds = service_account.Credentials.from_service_account_info(creds_dict)
+vision_client = vision.ImageAnnotatorClient(credentials=vision_creds)
 
-# -------------------- FASTAPI + BOT --------------------
+# ---------------- BOT + FASTAPI ----------------
 
 app = FastAPI()
 application = Application.builder().token(BOT_TOKEN).build()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-# -------------------- HELPERS --------------------
+# ---------------- HELPERS ----------------
 
-def log_event(event_type, uid=None, username=None, plot=None, details="", error=""):
-    SHEET_LOGS.append_row([
-        datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-        event_type,
-        uid,
-        username,
-        plot,
-        details,
-        error
-    ])
-
-def is_admin(uid: int) -> bool:
+def is_admin(uid: int):
     return uid in ADMIN_IDS
 
 def get_all_users():
     return SHEET_USERS.get_all_records()
 
 def find_user(uid=None, username=None):
-    users = get_all_users()
-    for idx, u in enumerate(users, start=2):
+    for i, u in enumerate(get_all_users(), start=2):
         if uid and str(u.get("Telegram_ID")) == str(uid):
-            return idx, u
-        if username and u.get("username") and u.get("username").lower() == username.lower():
-            return idx, u
+            return i, u
+        if username and u.get("username") and u["username"].lower() == username.lower():
+            return i, u
     return None, None
-
-def generate_qr(text: str) -> BytesIO:
-    qr = qrcode.make(text)
-    bio = BytesIO()
-    qr.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
-
-def get_requisites_text():
-    rows = SHEET_REKV.get_all_records()
-    r = rows[0]
-    return (
-        f"Получатель: {r.get('Получатель')}\n"
-        f"ИНН: {r.get('ИНН')}\n"
-        f"Счёт: {r.get('Счёт получателя')}\n"
-        f"Банк: {r.get('Банк')}\n"
-        f"БИК: {r.get('БИК')}\n"
-        f"Назначение: {r.get('Назначение платежа')}"
-    )
-
-def ensure_drive_folder(plot: str):
-    query = f"name='Участок_{plot}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    files = drive_service.files().list(q=query).execute().get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": f"Участок_{plot}", "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_FOLDER_ID]}
-    folder = drive_service.files().create(body=meta, fields="id").execute()
-    return folder["id"]
-
-def upload_to_drive(plot: str, filename: str, content: BytesIO):
-    folder_id = ensure_drive_folder(plot)
-    media = MediaIoBaseUpload(content, mimetype="image/jpeg")
-    meta = {"name": filename, "parents": [folder_id]}
-    file = drive_service.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
-    return file["webViewLink"]
 
 def ocr_receipt(image_bytes: bytes):
     image = vision.Image(content=image_bytes)
@@ -136,120 +85,68 @@ def ocr_receipt(image_bytes: bytes):
     text = response.text_annotations[0].description if response.text_annotations else ""
     return text
 
-def parse_amount_and_date(text: str):
-    amount_match = re.search(r'(\d+[.,]\d{2})\s*₽', text)
-    date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', text)
-    amount = amount_match.group(1).replace(",", ".") if amount_match else None
-    date = date_match.group(1) if date_match else None
-    return amount, date
+def parse_sum(text: str):
+    m = re.search(r"(\d+[.,]\d{2})", text.replace(",", "."))
+    return m.group(1) if m else None
 
-def allocate_payment(sum_paid: float, monthly_fee: float):
-    months = int(sum_paid // monthly_fee)
-    remainder = round(sum_paid - months * monthly_fee, 2)
-    return months, remainder
+def parse_date(text: str):
+    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+    return m.group(1) if m else None
 
-# -------------------- UI --------------------
+# ---------------- UI ----------------
 
-def main_keyboard(is_admin_user=False):
-    kb = [
-        ["💳 Реквизиты", "📊 Статус"],
-        ["ℹ️ Информация", "🔄 Старт"],
-    ]
-    if is_admin_user:
-        kb.append(["🛠 Админ панель", "📈 Статистика"])
+def main_keyboard(is_admin=False):
+    kb = [["💳 Реквизиты", "📊 Статус"], ["ℹ️ Информация"]]
+    if is_admin:
+        kb.append(["🛠 Админ", "📈 Статистика"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-# -------------------- HANDLERS --------------------
+# ---------------- HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    row, u = find_user(uid=user.id, username=user.username)
+    _, u = find_user(uid=user.id, username=user.username)
     if not u:
-        await update.message.reply_text("👋 Вы не зарегистрированы в системе ТСН.")
+        await update.message.reply_text("Вы не зарегистрированы. Обратитесь к администратору.")
         return
-
-    text = (
-        f"🌿 Добро пожаловать в ТСН ИСКОНА ПАРК!\n\n"
-        f"👤 {u.get('ФИО')}\n"
-        f"🏡 Участок: {u.get('Участок')}\n\n"
-        f"Мы рады, что вы с нами 😊"
-    )
-    await update.message.reply_text(text, reply_markup=main_keyboard(is_admin(user.id)))
-
-async def rekv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = get_requisites_text()
-    qr = generate_qr(text)
-    await update.message.reply_photo(qr, caption=text)
+    await update.message.reply_text("Добро пожаловать!", reply_markup=main_keyboard(is_admin(user.id)))
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, u = find_user(uid=update.effective_user.id, username=update.effective_user.username)
-    amount = u.get("Сумма") or "—"
-    await update.message.reply_text(
-        f"📊 Ваш статус:\n\n"
-        f"🏡 Участок: {u.get('Участок')}\n"
-        f"💳 Сумма: {amount} руб.\n"
-        f"📅 День оплаты: {u.get('День_оплаты')}\n"
-        f"📌 Статус: {u.get('Статус')}"
-    )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row, u = find_user(uid=user.id, username=user.username)
     if not u:
-        await update.message.reply_text("Вы не зарегистрированы.")
         return
+    await update.message.reply_text(f"Ваш статус: {u.get('Статус')}")
 
-    photo = await update.message.photo[-1].get_file()
+async def rekv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = SHEET_REKV.get_all_records()[0]
+    text = f"{r['Получатель']}\n{r['Счёт получателя']}\n{r['Банк']}\n{r['Назначение платежа']}"
+    qr = qrcode.make(text)
     bio = BytesIO()
-    await photo.download_to_memory(out=bio)
+    qr.save(bio, format="PNG")
     bio.seek(0)
+    await update.message.reply_photo(bio, caption=text)
 
-    ocr_text = ocr_receipt(bio.getvalue())
-    amount, date = parse_amount_and_date(ocr_text)
-
-    plot = u.get("Участок")
-    link = upload_to_drive(plot, f"check_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", bio)
-
-    SHEET_CHECKS.append_row([
-        user.id,
-        user.username,
-        u.get("ФИО"),
-        plot,
-        u.get("Телефон"),
-        link,
-        amount,
-        datetime.now().strftime("%d.%m.%Y"),
-        date,
-        date,
-        ocr_text[:500],
-        "нет",
-        photo.file_id,
-        "принят"
-    ])
-
-    SHEET_USERS.update_cell(row, list(SHEET_USERS.row_values(1)).index("Статус") + 1, "оплачено")
-
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = get_all_users()
+    debtors = [u for u in users if str(u.get("Статус")).lower() == "долг"]
     await update.message.reply_text(
-        "✅ Чек принят автоматически!\n\n"
-        f"💰 Сумма по чеку: {amount or 'не распознана'}\n"
-        f"📅 Дата по чеку: {date or 'не распознана'}\n\n"
-        "Если есть ошибка — сообщите администратору."
+        f"Всего: {len(users)}\nДолжники: {len(debtors)}\nПлатят: {len(users)-len(debtors)}"
     )
 
-# -------------------- ROUTER --------------------
+# ---------------- ROUTER ----------------
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔄 Старт":
-        await start(update, context)
-    elif text == "💳 Реквизиты":
-        await rekv(update, context)
-    elif text == "📊 Статус":
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "📊 Статус":
         await status(update, context)
+    elif t == "💳 Реквизиты":
+        await rekv(update, context)
+    elif t == "📈 Статистика":
+        await admin_stats(update, context)
     else:
-        await update.message.reply_text("Пожалуйста, используйте кнопки меню.")
+        await start(update, context)
 
-# -------------------- WEBHOOK --------------------
+# ---------------- WEBHOOK ----------------
 
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def telegram_webhook(req: Request):
@@ -258,18 +155,15 @@ async def telegram_webhook(req: Request):
     await application.process_update(update)
     return {"ok": True}
 
-# -------------------- STARTUP --------------------
+# ---------------- STARTUP ----------------
 
 @app.on_event("startup")
 async def on_startup():
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
     await application.initialize()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
     await application.start()
     await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}")
-
     scheduler.start()
     logger.info("🚀 Бот запущен")
 
@@ -278,7 +172,7 @@ async def on_shutdown():
     await application.stop()
     await application.shutdown()
 
-# -------------------- MAIN --------------------
+# ---------------- MAIN ----------------
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
