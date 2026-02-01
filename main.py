@@ -1,3 +1,67 @@
+# ====== imports ======
+import os
+import json
+import logging
+from datetime import datetime
+from io import BytesIO
+
+from fastapi import FastAPI, Request
+import uvicorn
+
+from dotenv import load_dotenv
+
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from google.cloud import vision
+
+import qrcode
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+# ====== config ======
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+PORT = int(os.getenv("PORT", 1000))
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tsn-bot")
+
+# ====== google auth ======
+creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/cloud-vision"
+]
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+
+gc = gspread.authorize(creds)
+spread = gc.open_by_key(SPREADSHEET_ID)
+
+SHEET_USERS = spread.worksheet("Лист 1")
+SHEET_CHECKS = spread.worksheet("Лист 2")
+SHEET_LOGS = spread.worksheet("Лист 3")
+SHEET_REKV = spread.worksheet("Реквизиты")
+
+drive_service = build("drive", "v3", credentials=creds)
+vision_client = vision.ImageAnnotatorClient(credentials=creds)
+
+# ====== app ======
+app = FastAPI()
+application = Application.builder().token(BOT_TOKEN).build()
+
 # ====== helpers ======
 def log_event(event, user, details=""):
     SHEET_LOGS.append_row([
