@@ -13,3 +13,4 @@ pillow
 python-dotenv
 asyncpg
 reportlab
+google-cloud-vision
