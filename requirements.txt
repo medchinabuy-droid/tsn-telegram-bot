@@ -12,3 +12,4 @@ openai
 pillow
 python-dotenv
 asyncpg
+matplotlib
