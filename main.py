@@ -757,3 +757,346 @@ async def send_tsn_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🗺 Карта посёлка доступна по ссылке:\n"
         "https://drive.google.com/drive/folders/17bulx860YtFtTqW7cexESTSTKOdTE7Pf"
     )
+
+# =========================
+# main.py — TSN Payment Bot (Monolith, modular blocks)
+# Python 3.11
+# =========================
+
+import os
+import io
+import json
+import base64
+import hashlib
+import asyncio
+import datetime
+from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+import uvicorn
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
+
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
+from google.cloud import vision
+from openai import OpenAI
+
+# =========================
+# ENV / CONFIG
+# =========================
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+MONTHLY_FEE = int(os.getenv("MONTHLY_FEE", "0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+PORT = int(os.getenv("PORT", "10000"))
+
+TSN_MAPS_FOLDER_ID = "17bulx860YtFtTqW7cexESTSTKOdTE7Pf"
+
+# =========================
+# GOOGLE AUTH (from ENV JSON)
+# =========================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_google_creds():
+    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    return Credentials.from_service_account_info(info, scopes=SCOPES)
+
+creds = get_google_creds()
+gc = gspread.authorize(creds)
+drive_service = build("drive", "v3", credentials=creds)
+
+# Vision
+vision_client = vision.ImageAnnotatorClient(credentials=creds)
+
+# OpenAI
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# FASTAPI + TELEGRAM WEBHOOK
+# =========================
+app = FastAPI()
+tg_app: Optional[Application] = None
+
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+    return {"ok": True}
+
+# =========================
+# HELPERS
+# =========================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def today_month_key():
+    now = datetime.date.today()
+    return f"{now.year}-{now.month:02d}"
+
+def hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+# =========================
+# GOOGLE SHEETS ACCESS
+# =========================
+def sh_main():
+    return gc.open_by_key(SPREADSHEET_ID)
+
+def ws_users():
+    return sh_main().worksheet("Лист1")
+
+def ws_payments():
+    return sh_main().worksheet("Платежи")
+
+def ws_requisites():
+    return sh_main().worksheet("Реквизиты")
+
+def get_plot_fee(plot: str) -> int:
+    ws = ws_users()
+    rows = ws.get_all_records()
+    for r in rows:
+        if str(r.get("Участок")) == str(plot):
+            return int(r.get("Сумма", MONTHLY_FEE))
+    return MONTHLY_FEE
+
+# =========================
+# REQUISITES
+# =========================
+def get_requisites():
+    rows = ws_requisites().get_all_records()
+    req = {}
+    qr_link = None
+    for r in rows:
+        k = r.get("Ключ")
+        v = r.get("Значение")
+        if k:
+            req[k] = v
+        if r.get("QR_оплата"):
+            qr_link = r.get("QR_оплата")
+    return req, qr_link
+
+# =========================
+# BANK DEEPLINKS
+# =========================
+BANKS = {
+    "vtb": {"name": "ВТБ 🟦", "deeplink": "vtbmobile://pay?amount={amount}"},
+    "alpha": {"name": "Альфа 🔴", "deeplink": "alfabank://pay?amount={amount}"},
+    "tbank": {"name": "Т-Банк ⚫️", "deeplink": "tinkoff://pay?amount={amount}"},
+    "sbp": {"name": "СБП 🟢", "deeplink": "sbp://pay?amount={amount}"},
+}
+
+def build_payment_links(amount: int):
+    return {k: v["deeplink"].format(amount=amount) for k, v in BANKS.items()}
+
+# =========================
+# OCR CHECKS + ANTI-DUPLICATE
+# =========================
+def ocr_text_from_image_bytes(b: bytes) -> str:
+    image = vision.Image(content=b)
+    resp = vision_client.text_detection(image=image)
+    if resp.text_annotations:
+        return resp.text_annotations[0].description
+    return ""
+
+def is_duplicate_check(image_hash: str) -> bool:
+    ws = ws_payments()
+    rows = ws.get_all_records()
+    for r in rows:
+        if r.get("hash") == image_hash:
+            return True
+    return False
+
+# =========================
+# PAYMENTS LOGIC
+# =========================
+def register_payment(user_id: int, plot: str, amount: int, image_hash: str):
+    ws = ws_payments()
+    ws.append_row([
+        str(user_id),
+        plot,
+        amount,
+        today_month_key(),
+        datetime.datetime.now().isoformat(),
+        image_hash,
+    ])
+
+# =========================
+# REMINDERS 5-3-1 + OVERDUE
+# =========================
+async def run_daily_reminders(app: Application):
+    users = ws_users().get_all_records()
+    today = datetime.date.today().day
+
+    for u in users:
+        chat_id = u.get("chat_id")
+        fio = u.get("ФИО")
+        plot = u.get("Участок")
+        pay_day = int(u.get("День_оплаты", 0))
+        status = u.get("Статус")
+
+        if not chat_id or status == "оплачено":
+            continue
+
+        diff = pay_day - today
+
+        if diff == 5:
+            text = f"👋 {fio}, через 5 дней срок оплаты по участку №{plot}."
+        elif diff == 3:
+            text = f"🔔 {fio}, осталось 3 дня до оплаты по участку №{plot}."
+        elif diff == 1:
+            text = f"⏰ {fio}, завтра день оплаты по участку №{plot}."
+        elif diff < 0:
+            text = f"⚠️ {fio}, по участку №{plot} есть просрочка оплаты."
+        else:
+            continue
+
+        try:
+            await app.bot.send_message(chat_id=int(chat_id), text=text)
+        except Exception as e:
+            print("Reminder error:", e)
+
+# =========================
+# GPT ADMIN ASSISTANT
+# =========================
+async def gpt_admin_help(prompt: str) -> str:
+    resp = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": "Ты помощник администратора СНТ. Коротко и по делу."},
+            {"role": "user", "content": prompt},
+        ]
+    )
+    return resp.choices[0].message.content
+
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("💳 Оплатить", callback_data="pay")],
+        [InlineKeyboardButton("📄 Реквизиты", callback_data="reqs")],
+    ]
+    if is_admin(update.effective_user.id):
+        kb.append([InlineKeyboardButton("🗺 Карта посёлка", callback_data="map")])
+        kb.append([InlineKeyboardButton("🤖 GPT-помощник", callback_data="gpt")])
+
+    await update.message.reply_text(
+        "Привет! Я бот оплаты взносов СНТ.",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "reqs":
+        req, qr_link = get_requisites()
+        text = (
+            "💳 Реквизиты:\n"
+            f"Получатель: {req.get('Получатель','')}\n"
+            f"ИНН: {req.get('ИНН','')}\n"
+            f"Счёт: {req.get('Счёт получателя','')}\n"
+            f"Назначение: {req.get('Назначение платежа','')}\n"
+        )
+        await q.message.reply_text(text)
+        if qr_link:
+            await q.message.reply_text(f"QR:\n{qr_link}")
+
+    elif q.data == "map":
+        await q.message.reply_text(
+            "🗺 Карта посёлка:\n"
+            "https://drive.google.com/drive/folders/17bulx860YtFtTqW7cexESTSTKOdTE7Pf"
+        )
+
+    elif q.data == "pay":
+        await q.message.reply_text("Пришли номер участка командой: /plot 12")
+
+    elif q.data == "gpt":
+        await q.message.reply_text("Напиши вопрос для GPT-помощника админу.")
+
+async def set_plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    plot = context.args[0]
+    amount = get_plot_fee(plot)
+    links = build_payment_links(amount)
+
+    kb = [
+        [InlineKeyboardButton(BANKS["vtb"]["name"], url=links["vtb"])],
+        [InlineKeyboardButton(BANKS["alpha"]["name"], url=links["alpha"])],
+        [InlineKeyboardButton(BANKS["tbank"]["name"], url=links["tbank"])],
+        [InlineKeyboardButton(BANKS["sbp"]["name"], url=links["sbp"])],
+    ]
+    await update.message.reply_text(
+        f"К оплате по участку {plot}: {amount} ₽",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = await update.message.photo[-1].get_file()
+    b = await photo.download_as_bytearray()
+    h = hash_bytes(bytes(b))
+
+    if is_duplicate_check(h):
+        await update.message.reply_text("⚠️ Такой чек уже был загружен.")
+        return
+
+    text = ocr_text_from_image_bytes(bytes(b))
+    register_payment(update.effective_user.id, "?", 0, h)
+
+    await update.message.reply_text("✅ Чек принят, отправлен на проверку админу.")
+
+async def handle_gpt_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    ans = await gpt_admin_help(update.message.text)
+    await update.message.reply_text(ans)
+
+# =========================
+# BOOTSTRAP
+# =========================
+async def main():
+    global tg_app
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("plot", set_plot))
+    tg_app.add_handler(CallbackQueryHandler(callbacks))
+    tg_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    tg_app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_IDS), handle_gpt_admin))
+
+    await tg_app.initialize()
+    await tg_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}")
+    await tg_app.start()
+
+    # Планировщик напоминаний (1 раз в день)
+    async def reminders_loop():
+        while True:
+            await run_daily_reminders(tg_app)
+            await asyncio.sleep(24 * 3600)
+
+    asyncio.create_task(reminders_loop())
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(main())
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
