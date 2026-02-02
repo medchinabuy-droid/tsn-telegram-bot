@@ -1,3 +1,4 @@
+# main.py
 import os, json, re, logging
 from datetime import datetime, date
 from pathlib import Path
@@ -49,19 +50,24 @@ def get_or_create_sheet(title: str, headers: List[str]):
             ws.update("A1", [headers])
         return ws
     except:
-        ws = SPREAD.add_worksheet(title=title, rows=2000, cols=30)
+        ws = SPREAD.add_worksheet(title=title, rows=2000, cols=40)
         ws.update("A1", [headers])
         return ws
 
-SHEET_USERS = get_or_create_sheet("Пользователи", [
-    "ФИО", "Участок", "Сумма", "День_оплаты", "Статус", "ДР", "Телефон",
-    "Telegram_ID", "username"
+SHEET_USERS = get_or_create_sheet("Лист 1", [
+    "Участок","ФИО","Telegram_ID","username","Телефон","День_оплаты","Электро","Сумма",
+    "Дата","Статус","Роль","Дата_напоминания","Дата_рождения","Дата_регистрации",
+    "Последняя_оплата","Комментарий_админа","Активен"
 ])
-SHEET_CHECKS = get_or_create_sheet("Чеки", [
-    "Дата_загрузки", "Telegram_ID", "ФИО", "Участок",
-    "Сумма_по_чеку", "Дата_по_чеку", "Путь_к_файлу", "Статус"
+
+SHEET_CHECKS = get_or_create_sheet("Лист 2", [
+    "telegram_id","username","ФИО","Дом","Телефон","Ссылка_на_чек","Сумма_по_чеку",
+    "Дата_загрузки","Дата_чека","OCR_Дата","OCR","Дубль_чека","File_Unique_ID","Статус"
 ])
-SHEET_REKV = get_or_create_sheet("Реквизиты", ["Ключ", "Значение"])
+
+SHEET_REKV = get_or_create_sheet("Реквизиты", [
+    "Ключ","Значение","Счёт получателя","Получатель","ИНН","Назначение платежа","QR_оплата"
+])
 
 vision_client = vision.ImageAnnotatorClient(credentials=creds)
 
@@ -73,147 +79,131 @@ scheduler = AsyncIOScheduler()
 # ================== KEYBOARDS ==================
 def user_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("ℹ️ Информация"), KeyboardButton("💳 Реквизиты")],
-        [KeyboardButton("📊 Ваш статус"), KeyboardButton("📎 Загрузить чек")]
+        [KeyboardButton("📊 Ваш статус"), KeyboardButton("💳 Реквизиты")],
+        [KeyboardButton("📎 Загрузить чек"), KeyboardButton("🚀 Старт")]
     ], resize_keyboard=True)
 
 def admin_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🛠 Админ-панель"), KeyboardButton("📈 Админ-статистика")],
-        [KeyboardButton("📣 Уведомить участок")]
+        [KeyboardButton("📊 Ваш статус"), KeyboardButton("💳 Реквизиты")],
+        [KeyboardButton("📎 Загрузить чек"), KeyboardButton("🚀 Старт")],
+        [KeyboardButton("🛠 Админ-панель"), KeyboardButton("📣 Массовые уведомления")]
     ], resize_keyboard=True)
 
 def start_kb():
-    return ReplyKeyboardMarkup([[KeyboardButton("🚀 Поехали")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([[KeyboardButton("🚀 Старт")]], resize_keyboard=True)
 
 # ================== HELPERS ==================
-def is_admin(uid: int) -> bool:
-    return uid in ADMINS
+MONTHS = {
+    "янв": 1, "январ": 1, "january": 1,
+    "фев": 2, "феврал": 2, "feb": 2,
+    "мар": 3, "март": 3,
+    "апр": 4, "апрел": 4,
+    "май": 5,
+    "июн": 6,
+    "июл": 7,
+    "авг": 8,
+    "сен": 9, "сент": 9,
+    "окт": 10,
+    "ноя": 11,
+    "дек": 12,
+}
 
-def get_users() -> List[Dict]:
+def parse_months(text: str, year: int):
+    text = text.lower()
+    found = set()
+    for k, v in MONTHS.items():
+        if k in text:
+            found.add(f"{year}-{v:02d}")
+    nums = re.findall(r"\b(0?[1-9]|1[0-2])\b", text)
+    for n in nums:
+        found.add(f"{year}-{int(n):02d}")
+    return sorted(found)
+
+def detect_bank(text: str):
+    t = text.lower()
+    if "сбер" in t: return "Сбер"
+    if "тинькофф" in t or "tinkoff" in t: return "Тинькофф"
+    if "втб" in t: return "ВТБ"
+    if "альфа" in t: return "Альфа"
+    return "Неизвестно"
+
+def get_users():
     return SHEET_USERS.get_all_records()
 
-def find_user_by_tg(tg_id: int) -> Optional[Dict]:
-    for row in get_users():
-        if str(row.get("Telegram_ID")) == str(tg_id):
-            return row
-    return None
+def find_user(uid):
+    for i, r in enumerate(get_users(), start=2):
+        if str(r.get("Telegram_ID")) == str(uid):
+            return i, r
+    return None, None
 
-def update_user_row(tg_id: int, updates: Dict):
-    rows = SHEET_USERS.get_all_records()
-    for i, row in enumerate(rows, start=2):
-        if str(row.get("Telegram_ID")) == str(tg_id):
-            for col, val in updates.items():
-                col_idx = SHEET_USERS.find(col).col
-                SHEET_USERS.update_cell(i, col_idx, val)
-            return
+def update_user(row_i, updates: Dict):
+    for col, val in updates.items():
+        col_idx = SHEET_USERS.find(col).col
+        SHEET_USERS.update_cell(row_i, col_idx, val)
+
+def get_or_create_month_sheet(ym: str):
+    headers = ["Дата","Telegram_ID","ФИО","Участок","Сумма","Источник"]
+    return get_or_create_sheet(ym, headers)
 
 def parse_sum_and_date(text: str):
-    text_low = text.lower()
-    sum_patterns = [
-        r"итого[:\s]+([\d\s]+)",
-        r"к оплате[:\s]+([\d\s]+)",
-        r"сумма[:\s]+([\d\s]+)",
-        r"([\d]{3,6})\s?руб"
-    ]
-    date_patterns = [r"(\d{2}\.\d{2}\.\d{4})", r"(\d{2}/\d{2}/\d{4})"]
-
-    amount, dt = None, None
-    for p in sum_patterns:
-        m = re.search(p, text_low)
-        if m:
-            amount = int(m.group(1).replace(" ", ""))
-            break
-    for p in date_patterns:
-        m = re.search(p, text_low)
-        if m:
-            dt = m.group(1).replace("/", ".")
-            break
+    amount = None
+    dt = None
+    m = re.search(r"(\d{3,6})\s?руб", text.lower())
+    if m:
+        amount = int(m.group(1))
+    d = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+    if d:
+        dt = d.group(1)
     return amount, dt
 
-# ================== BOT HANDLERS ==================
+# ================== BOT ==================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Нажмите «Поехали», чтобы начать.", reply_markup=start_kb())
-
-async def start_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    existing = find_user_by_tg(user.id)
-
-    if existing:
-        fio = existing.get("ФИО") or user.full_name
-        kb = admin_kb() if is_admin(user.id) else user_kb()
-        await update.message.reply_text(f"С возвращением, {fio}! 👋", reply_markup=kb)
-    else:
-        SHEET_USERS.append_row(["", "", "", "", "не оплачено", "", "", user.id, user.username])
-        context.user_data["reg_step"] = "fio"
-        await update.message.reply_text("Введите ФИО для подтверждения личности:")
-
-async def registration_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("reg_step")
-    if not step:
-        return
     uid = update.effective_user.id
-    txt = update.message.text.strip()
-
-    if step == "fio":
-        update_user_row(uid, {"ФИО": txt})
-        context.user_data["reg_step"] = "phone"
-        await update.message.reply_text("📞 Укажите телефон:")
-    elif step == "phone":
-        update_user_row(uid, {"Телефон": txt})
-        context.user_data["reg_step"] = "birth"
-        await update.message.reply_text("🎂 Дата рождения (ДД.ММ.ГГГГ):")
-    elif step == "birth":
-        update_user_row(uid, {"ДР": txt})
-        context.user_data["reg_step"] = None
-        await update.message.reply_text("✅ Регистрация завершена!", reply_markup=user_kb())
-
-async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ Информация о взносах:\n\n"
-        "• Взнос ежемесячный 6000 руб.\n"
-        "• Сумма может отличаться при наличии льгот\n"
-        "• День оплаты указан индивидуально\n"
-        "• Чеки проверяются автоматически\n"
-        "• При просрочке формируется задолженность\n\n"
-        "📧 propusk@tsn-iskona-park.ru\n"
-        "📧 info@iskonapark.ru",
-        reply_markup=user_kb()
-    )
+    row_i, user = find_user(uid)
+    kb = admin_kb() if uid in ADMINS else user_kb()
+    if user:
+        fio = user.get("ФИО") or update.effective_user.full_name
+        await update.message.reply_text(f"С возвращением, {fio} 👋", reply_markup=kb)
+    else:
+        SHEET_USERS.append_row(["","","",update.effective_user.username,"","","","","не оплачено","","", "", "", str(date.today()), "", "", "TRUE"])
+        await update.message.reply_text("Привет! Мы вас зарегистрировали 👋", reply_markup=kb)
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = find_user_by_tg(update.effective_user.id)
+    row_i, u = find_user(update.effective_user.id)
+    if not u:
+        return
     await update.message.reply_text(
         f"📊 Ваш статус:\n\n"
-        f"ФИО: {u.get('ФИО')}\n"
         f"Участок: {u.get('Участок')}\n"
         f"Сумма: {u.get('Сумма')}\n"
         f"День оплаты: {u.get('День_оплаты')}\n"
         f"Статус: {u.get('Статус')}",
-        reply_markup=user_kb()
+        reply_markup=admin_kb() if update.effective_user.id in ADMINS else user_kb()
     )
 
 async def rekv_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = SHEET_REKV.get_all_records()
-    text, qr = [], None
+    txt, qr = [], None
     for r in rows:
-        if "qr" in (r.get("Ключ") or "").lower():
-            qr = r.get("Значение")
+        if r.get("QR_оплата"):
+            qr = r.get("QR_оплата")
         else:
-            text.append(f"{r.get('Ключ')}: {r.get('Значение')}")
-    await update.message.reply_text("💳 Реквизиты:\n\n" + "\n".join(text))
+            txt.append(f"{r.get('Ключ')}: {r.get('Значение')}")
+    await update.message.reply_text("💳 Реквизиты:\n" + "\n".join(txt))
     if qr:
         await update.message.reply_photo(qr)
 
 async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = find_user_by_tg(update.effective_user.id)
+    uid = update.effective_user.id
+    row_i, user = find_user(uid)
+
     photo = update.message.photo[-1]
     file = await photo.get_file()
 
-    plot = user.get("Участок") or "Неизвестно"
-    folder = BASE_CHECKS_DIR / f"Участок_{plot}"
+    folder = BASE_CHECKS_DIR / f"user_{uid}"
     folder.mkdir(parents=True, exist_ok=True)
-    fname = folder / f"чек_{date.today()}_{update.effective_user.id}.jpg"
+    fname = folder / f"check_{datetime.now().timestamp()}.jpg"
     await file.download_to_drive(str(fname))
 
     with open(fname, "rb") as f:
@@ -222,39 +212,68 @@ async def upload_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = res.full_text_annotation.text if res.text_annotations else ""
 
     amount, dt = parse_sum_and_date(text)
-    SHEET_CHECKS.append_row([str(datetime.now()), update.effective_user.id, user.get("ФИО"),
-                             plot, amount, dt, str(fname), "оплачено"])
-    update_user_row(update.effective_user.id, {"Статус": "оплачено"})
-    await update.message.reply_text("✅ Чек принят, оплата зачтена!")
+    bank = detect_bank(text)
+
+    context.user_data["last_check"] = {
+        "amount": amount,
+        "dt": dt,
+        "bank": bank,
+        "file": str(fname)
+    }
+
+    expected = int(user.get("Сумма") or 0)
+    if amount and expected and amount != expected:
+        await update.message.reply_text(
+            f"⚠️ В чеке сумма {amount}₽, а по участку {expected}₽.\n"
+            f"За какие месяцы платёж? Напишите: например «янв февраль»"
+        )
+    else:
+        ym = datetime.now().strftime("%Y-%m")
+        ws = get_or_create_month_sheet(ym)
+        ws.append_row([str(datetime.now()), uid, user.get("ФИО"), user.get("Участок"), amount, bank])
+        await update.message.reply_text("✅ Чек принят и учтён за текущий месяц")
+
+async def months_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("last_check")
+    if not data:
+        return
+    months = parse_months(update.message.text, datetime.now().year)
+    row_i, user = find_user(update.effective_user.id)
+
+    for ym in months:
+        ws = get_or_create_month_sheet(ym)
+        ws.append_row([str(datetime.now()), update.effective_user.id, user.get("ФИО"), user.get("Участок"), data["amount"], data["bank"]])
+
+    await update.message.reply_text(f"✅ Учёл оплату за месяцы: {', '.join(months)}")
+    context.user_data["last_check"] = None
 
 # ================== APSCHEDULER ==================
 async def notify_payments():
     today = date.today().day
     for u in get_users():
         try:
-            pay_day = int(u.get("День_оплаты"))
+            pay_day = int(u.get("День_оплаты") or 0)
             tg_id = int(u.get("Telegram_ID"))
             fio = u.get("ФИО")
             delta = pay_day - today
             if delta in (5, 3, 1):
-                await application.bot.send_message(tg_id, f"Здравствуйте, {fio}! Напоминаем об оплате взноса через {delta} дн.")
+                await application.bot.send_message(tg_id, f"{fio}, напоминание об оплате через {delta} дн.")
             elif delta < 0 and u.get("Статус") != "оплачено":
-                await application.bot.send_message(tg_id, f"{fio}, у вас задолженность по взносам. Просим срочно оплатить.")
+                await application.bot.send_message(tg_id, f"{fio}, у вас задолженность по взносам.")
         except:
             pass
 
 async def notify_birthdays():
     today = date.today().strftime("%d.%m")
     for u in get_users():
-        if u.get("ДР") == today:
-            await application.bot.send_message(int(u["Telegram_ID"]),
-                f"🎉 С Днём Рождения, {u.get('ФИО')}! Желаем уюта, благополучия и отличного настроения!")
+        if u.get("Дата_рождения") == today:
+            await application.bot.send_message(int(u["Telegram_ID"]), f"🎉 С Днём Рождения, {u.get('ФИО')}!")
 
 def schedule_jobs():
     scheduler.add_job(lambda: notify_payments(), CronTrigger(hour=9, minute=0))
     scheduler.add_job(lambda: notify_birthdays(), CronTrigger(hour=10, minute=0))
 
-# ================== WEB ==================
+# ================== DASHBOARD ==================
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     users = get_users()
@@ -266,7 +285,7 @@ async def dashboard():
     <canvas id="c"></canvas>
     <script>
     new Chart(document.getElementById('c'), {{
-        type: 'doughnut',
+        type: 'bar',
         data: {{
             labels: ['Оплачено', 'Долги'],
             datasets: [{{ data: [{paid}, {debt}] }}]
@@ -275,6 +294,7 @@ async def dashboard():
     </script>
     """)
 
+# ================== WEBHOOK ==================
 @app.post(WEBHOOK_PATH)
 async def webhook(req: Request):
     data = await req.json()
@@ -292,12 +312,11 @@ async def startup():
 
 # ================== HANDLERS ==================
 application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(MessageHandler(filters.Regex("^🚀 Поехали$"), start_flow))
-application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^ℹ️ Информация$"), info_handler))
+application.add_handler(MessageHandler(filters.Regex("^🚀 Старт$"), cmd_start))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Ваш статус$"), status_handler))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^💳 Реквизиты$"), rekv_handler))
 application.add_handler(MessageHandler(filters.PHOTO, upload_check))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_flow))
+application.add_handler(MessageHandler(filters.TEXT, months_reply))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
