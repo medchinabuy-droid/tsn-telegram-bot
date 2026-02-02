@@ -637,3 +637,123 @@ async def admin_gpt_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # можно повесить на префикс "GPT:"
 application.add_handler(MessageHandler(filters.Regex("^GPT:"), admin_gpt_chat))
+
+# ========= РЕКВИЗИТЫ =========
+
+def get_requisites():
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Реквизиты")
+    rows = ws.get_all_records()
+
+    req = {}
+    for r in rows:
+        key = r.get("Ключ")
+        value = r.get("Значение")
+        if key:
+            req[key] = value
+
+    qr_link = None
+    for r in rows:
+        if r.get("QR_оплата"):
+            qr_link = r.get("QR_оплата")
+            break
+
+    return req, qr_link
+
+
+async def send_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    req, qr_link = get_requisites()
+
+    text = (
+        "💳 <b>Реквизиты для оплаты</b>\n\n"
+        f"🏦 Получатель: {req.get('Получатель','')}\n"
+        f"📄 ИНН: {req.get('ИНН','')}\n"
+        f"💼 Счёт: {req.get('Счёт получателя','')}\n"
+        f"📝 Назначение: {req.get('Назначение платежа','')}\n"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+    if qr_link:
+        await update.message.reply_text(f"📎 QR для оплаты:\n{qr_link}")
+
+# ========= АВТОНАПОМИНАНИЯ =========
+
+def get_users_for_reminders():
+    ws = gc.open_by_key(SPREADSHEET_ID).worksheet("Лист1")
+    return ws.get_all_records()
+
+
+async def run_daily_reminders(app):
+    users = get_users_for_reminders()
+    today = datetime.date.today().day
+
+    for u in users:
+        chat_id = u.get("chat_id")
+        fio = u.get("ФИО")
+        plot = u.get("Участок")
+        pay_day = int(u.get("День_оплаты", 0))
+        status = u.get("Статус")
+
+        if not chat_id or status == "оплачено":
+            continue
+
+        diff = pay_day - today
+
+        if diff == 5:
+            text = f"👋 {fio}, добрый день!\nЧерез 5 дней срок оплаты взноса по участку №{plot}."
+        elif diff == 3:
+            text = f"🔔 {fio}, напоминаем об оплате взноса по участку №{plot}. Осталось 3 дня."
+        elif diff == 1:
+            text = f"⏰ {fio}, завтра день оплаты взноса по участку №{plot}."
+        elif diff < 0:
+            text = f"⚠️ {fio}, по участку №{plot} зафиксирована просрочка оплаты."
+
+        else:
+            continue
+
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            print("Ошибка рассылки:", e)
+
+# ========= DEEPLINK ОПЛАТЫ =========
+
+BANKS = {
+    "vtb": {"name": "ВТБ 🟦", "deeplink": "vtbmobile://pay?amount={amount}"},
+    "alpha": {"name": "Альфа 🔴", "deeplink": "alfabank://pay?amount={amount}"},
+    "tbank": {"name": "Т-Банк ⚫️", "deeplink": "tinkoff://pay?amount={amount}"},
+    "sbp": {"name": "СБП 🟢", "deeplink": "sbp://pay?amount={amount}"}
+}
+
+
+def build_payment_links(amount: int):
+    links = {}
+    for k, v in BANKS.items():
+        links[k] = v["deeplink"].format(amount=amount)
+    return links
+
+
+async def send_payment_options(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
+    links = build_payment_links(amount)
+
+    text = f"💰 К оплате: <b>{amount} ₽</b>\nВыберите банк:"
+
+    keyboard = [
+        [InlineKeyboardButton(BANKS["vtb"]["name"], url=links["vtb"])],
+        [InlineKeyboardButton(BANKS["alpha"]["name"], url=links["alpha"])],
+        [InlineKeyboardButton(BANKS["tbank"]["name"], url=links["tbank"])],
+        [InlineKeyboardButton(BANKS["sbp"]["name"], url=links["sbp"])],
+    ]
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+# ========= КАРТА ПОСЁЛКА =========
+
+TSN_MAPS_FOLDER_ID = "17bulx860YtFtTqW7cexESTSTKOdTE7Pf"
+
+async def send_tsn_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🗺 Карта посёлка доступна по ссылке:\n"
+        "https://drive.google.com/drive/folders/17bulx860YtFtTqW7cexESTSTKOdTE7Pf"
+    )
