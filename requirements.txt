@@ -13,3 +13,5 @@ python-dotenv
 asyncpg
 reportlab
 google-cloud-vision
+openai>=1.40.0
+pip install openai
