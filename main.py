@@ -1,14 +1,11 @@
-# =========================
-# main.py — TSN Payment Bot (Part 1/2)
-# Python 3.11 | FastAPI + python-telegram-bot v21
-# =========================
-
 import os
 import io
 import json
+import re
+import hashlib
 import logging
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, date
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -32,42 +29,37 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from google.cloud import vision
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # =========================
-# 1. ENV И КОНФИГ
+# 1. ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", "10000"))
-
 ADMIN_IDS = set(int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip().isdigit())
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-# Папка Google Drive с картами посёлка
 TSN_MAPS_FOLDER_ID = os.getenv("TSN_MAPS_FOLDER_ID", "17bulx860YtFtTqW7cexESTSTKOdTE7Pf")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not SPREADSHEET_ID:
-    raise RuntimeError("SPREADSHEET_ID is not set")
-if not GOOGLE_CREDENTIALS_JSON:
-    raise RuntimeError("GOOGLE_CREDENTIALS_JSON is not set")
+if not BOT_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+    raise RuntimeError("❌ Не заданы ENV переменные")
 
 # =========================
-# 2. ЛОГГИНГ
+# 2. ЛОГИ
 # =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tsn-bot")
 
 # =========================
-# 3. GOOGLE AUTH (Sheets + Drive)
+# 3. GOOGLE AUTH
 # =========================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 def get_google_creds():
@@ -77,29 +69,30 @@ def get_google_creds():
 creds = get_google_creds()
 gc = gspread.authorize(creds)
 drive_service = build("drive", "v3", credentials=creds)
+vision_client = vision.ImageAnnotatorClient(credentials=creds)
 
 def get_sheet(name: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
     try:
         return sh.worksheet(name)
-    except gspread.WorksheetNotFound:
+    except Exception:
         return sh.add_worksheet(title=name, rows=1000, cols=30)
 
-sheet_main = get_sheet("Лист 1")        # tg_id, ФИО, Участок, Сумма, День оплаты, Статус
-sheet_reqs = get_sheet("Реквизиты")    # Ключ, Значение, Счёт получателя, Получатель, ИНН, Назначение платежа, QR_оплата
+sheet_main = get_sheet("Лист 1")
+sheet_reqs = get_sheet("Реквизиты")
+sheet_checks = get_sheet("Лист 2")
 
 # =========================
-# 4. FASTAPI + TELEGRAM
+# 4. FASTAPI + TG
 # =========================
 app = FastAPI()
 application = Application.builder().token(BOT_TOKEN).build()
 
 # =========================
-# 5. УТИЛИТЫ (Sheets)
+# 5. УТИЛИТЫ
 # =========================
 def get_user_row_by_tg_id(tg_id: int) -> Optional[Dict[str, Any]]:
-    rows = sheet_main.get_all_records()
-    for r in rows:
+    for r in sheet_main.get_all_records():
         if str(r.get("tg_id", "")).strip() == str(tg_id):
             return r
     return None
@@ -112,7 +105,7 @@ def get_expected_amount_for_user(tg_id: int) -> int:
     row = get_user_row_by_tg_id(tg_id)
     try:
         return int(row.get("Сумма", 0)) if row else 0
-    except Exception:
+    except:
         return 0
 
 def get_user_fio(tg_id: int) -> str:
@@ -120,74 +113,49 @@ def get_user_fio(tg_id: int) -> str:
     return str(row.get("ФИО", "")) if row else ""
 
 def get_requisites() -> Dict[str, str]:
-    rows = sheet_reqs.get_all_records()
     req = {}
-
-    for r in rows:
-        key = r.get("Ключ")
-        val = r.get("Значение")
-        if key:
-            req[key] = val
-
-        if r.get("QR_оплата"):
-            req["QR_оплата"] = r.get("QR_оплата")
-
-    return req
-    # QR_оплата может быть отдельным столбцом
-    for r in rows:
-        if r.get("QR_оплата"):
-            req["QR_оплата"] = r.get("QR_оплата")
-            break
+    for r in sheet_reqs.get_all_records():
+        for k, v in r.items():
+            if k and v:
+                req[k] = v
     return req
 
 # =========================
-# 6. ОПЛАТА (Deeplink)
+# 6. ОПЛАТА (Deeplink банки)
 # =========================
 BANKS = {
-    "sbp": {
-        "name": "🟢 СБП",
-        "deeplink": "https://qr.nspk.ru/AS1A0000000000000000000000000000000000?amount={amount}"
-    },
-    "vtb": {
-        "name": "🔵 ВТБ",
-        "deeplink": "https://online.vtb.ru/payments?amount={amount}"
-    },
-    "alpha": {
-        "name": "🔴 Альфа-Банк",
-        "deeplink": "https://alfabank.ru/payments/transfer?amount={amount}"
-    },
-    "tbank": {
-        "name": "🟡 Т-Банк",
-        "deeplink": "https://www.tinkoff.ru/payments/form?amount={amount}"
-    },
+    "sbp": {"name": "🟢 СБП", "deeplink": "https://qr.nspk.ru/?amount={amount}"},
+    "vtb": {"name": "🔵 ВТБ", "deeplink": "https://online.vtb.ru/payments?amount={amount}"},
+    "alpha": {"name": "🔴 Альфа-Банк", "deeplink": "https://alfabank.ru/payments/transfer?amount={amount}"},
+    "tbank": {"name": "🟡 Т-Банк", "deeplink": "https://www.tinkoff.ru/payments/form?amount={amount}"},
 }
 
 def build_payment_keyboard(amount: int) -> InlineKeyboardMarkup:
     kb = []
-    for k, v in BANKS.items():
+    for v in BANKS.values():
         kb.append([InlineKeyboardButton(v["name"], url=v["deeplink"].format(amount=amount))])
     return InlineKeyboardMarkup(kb)
 
 # =========================
-# 7. КНОПКИ
+# 7. КЛАВИАТУРЫ
 # =========================
-def user_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def user_keyboard(is_admin=False):
     rows = [
-        [KeyboardButton("💳 Оплата"), KeyboardButton("📄 Реквизиты")],
-        [KeyboardButton("👉 Оплатил"), KeyboardButton("ℹ️ Информация")],
+        [KeyboardButton("💳 Оплатить"), KeyboardButton("📄 Реквизиты")],
+        [KeyboardButton("👉 Я оплатил"), KeyboardButton("ℹ️ Мои данные")],
     ]
     if is_admin:
         rows.append([KeyboardButton("🛠 Админ-панель")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def admin_panel_keyboard() -> ReplyKeyboardMarkup:
+def admin_panel_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📨 Уведомить собственника")],
             [KeyboardButton("🗺 Карта посёлка")],
-            [KeyboardButton("⬅️ Назад в меню")],
+            [KeyboardButton("⬅️ Назад")],
         ],
-        resize_keyboard=True,
+        resize_keyboard=True
     )
 
 # =========================
@@ -196,174 +164,107 @@ def admin_panel_keyboard() -> ReplyKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     is_admin = uid in ADMIN_IDS
-    text = (
-        "Привет! 👋\n\n"
-        "Здесь можно оплатить взносы ТСН, посмотреть реквизиты и отправить чек.\n\n"
-        "• Сумма берётся автоматически по вашему участку\n"
-        "• Напоминания приходят автоматически\n"
+    await update.message.reply_text(
+        "👋 Добро пожаловать в бот ТСН!\n\n"
+        "Здесь вы можете оплатить взносы, получить реквизиты и отправить чек.",
+        reply_markup=user_keyboard(is_admin)
     )
-    await update.message.reply_text(text, reply_markup=user_keyboard(is_admin=is_admin))
 
 async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    fio = get_user_fio(uid)
-    plot = get_plot_number_for_user(uid)
-    amount = get_expected_amount_for_user(uid)
-    text = (
-        f"ℹ️ Ваша информация:\n\n"
-        f"ФИО: {fio or '—'}\n"
-        f"Участок: {plot}\n"
-        f"Сумма к оплате: {amount} ₽\n"
+    await update.message.reply_text(
+        f"ℹ️ Ваши данные:\n"
+        f"ФИО: {get_user_fio(uid)}\n"
+        f"Участок: {get_plot_number_for_user(uid)}\n"
+        f"Сумма: {get_expected_amount_for_user(uid)} ₽"
     )
-    await update.message.reply_text(text)
 
 async def handle_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     amount = get_expected_amount_for_user(uid)
     if not amount:
-        await update.message.reply_text("❌ Не удалось определить сумму по участку. Обратитесь к администратору.")
+        await update.message.reply_text("❌ Сумма не найдена, обратитесь к администратору.")
         return
-    kb = build_payment_keyboard(amount)
     await update.message.reply_text(
-        f"💳 К оплате: <b>{amount} ₽</b>\nВыберите способ оплаты:",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"💳 К оплате: {amount} ₽",
+        reply_markup=build_payment_keyboard(amount)
     )
 
 async def handle_reqs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = get_requisites()
     text = (
-        "📄 <b>Реквизиты для оплаты</b>\n\n"
-        f"🏦 Получатель: {req.get('Получатель','')}\n"
-        f"📄 ИНН: {req.get('ИНН','')}\n"
-        f"💼 Счёт: {req.get('Счёт получателя','')}\n"
-        f"📝 Назначение: {req.get('Назначение платежа','')}\n"
+        f"📄 Реквизиты:\n\n"
+        f"Получатель: {req.get('Получатель','')}\n"
+        f"ИНН: {req.get('ИНН','')}\n"
+        f"Счёт: {req.get('Счёт получателя','')}\n"
+        f"Назначение: {req.get('Назначение платежа','')}"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text)
     if req.get("QR_оплата"):
-        await update.message.reply_text(f"📎 QR для оплаты:\n{req['QR_оплата']}")
+        await update.message.reply_photo(photo=req["QR_оплата"], caption="📎 QR для оплаты")
 
 async def handle_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📎 Пришлите, пожалуйста, чек (фото/скрин). Я проверю автоматически.")
+    await update.message.reply_text("📎 Пришлите фото чека.")
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        return
-    await update.message.reply_text("🛠 Админ-панель:", reply_markup=admin_panel_keyboard())
+    await update.message.reply_text("🛠 Админ-панель", reply_markup=admin_panel_keyboard())
 
 async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    is_admin = uid in ADMIN_IDS
-    await update.message.reply_text("⬅️ Возврат в меню", reply_markup=user_keyboard(is_admin=is_admin))
+    await update.message.reply_text("⬅️ Возврат в меню", reply_markup=user_keyboard(True))
 
 async def admin_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        return
-
     res = drive_service.files().list(
         q=f"'{TSN_MAPS_FOLDER_ID}' in parents and trashed=false",
-        fields="files(id, name, modifiedTime)",
-        orderBy="modifiedTime desc",
-        pageSize=1,
+        fields="files(id, name)",
+        pageSize=1
     ).execute()
     files = res.get("files", [])
     if not files:
-        await update.message.reply_text("❌ В папке с картами нет файлов.")
+        await update.message.reply_text("❌ Карта не найдена.")
         return
-
     file_id = files[0]["id"]
-    name = files[0]["name"]
-
-    request = drive_service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
+    downloader = MediaIoBaseDownload(fh, drive_service.files().get_media(fileId=file_id))
     done = False
     while not done:
         status, done = downloader.next_chunk()
-
     fh.seek(0)
     await update.message.reply_photo(photo=fh, caption="🗺 Карта посёлка")
 
 # =========================
-# 9. WEBHOOK
-# =========================
-@app.post("/webhook")
-async def telegram_webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
-    await application.update_queue.put(update)
-    return {"ok": True}
-
-@app.get("/")
-async def health():
-    return {"status": "ok", "service": "TSN bot running"}
-
-@app.on_event("startup")
-async def on_startup():
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    logger.info("✅ Bot started + webhook set")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await application.stop()
-    await application.shutdown()
-
-# =========================
-# 10. РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
+# 9. РЕГИСТРАЦИЯ
 # =========================
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.Regex("^ℹ️ Информация$"), handle_info))
-application.add_handler(MessageHandler(filters.Regex("^💳 Оплата$"), handle_pay))
+application.add_handler(MessageHandler(filters.Regex("^ℹ️ Мои данные$"), handle_info))
+application.add_handler(MessageHandler(filters.Regex("^💳 Оплатить$"), handle_pay))
 application.add_handler(MessageHandler(filters.Regex("^📄 Реквизиты$"), handle_reqs))
-application.add_handler(MessageHandler(filters.Regex("^👉 Оплатил$"), handle_paid))
+application.add_handler(MessageHandler(filters.Regex("^👉 Я оплатил$"), handle_paid))
 application.add_handler(MessageHandler(filters.Regex("^🛠 Админ-панель$"), admin_panel))
 application.add_handler(MessageHandler(filters.Regex("^🗺 Карта посёлка$"), admin_map))
-application.add_handler(MessageHandler(filters.Regex("^⬅️ Назад в меню$"), admin_back))
-
+application.add_handler(MessageHandler(filters.Regex("^⬅️ Назад$"), admin_back))
 # =========================
-# 11. ENTRYPOINT
+# 10. OCR + АНТИДУБЛИКАТЫ
 # =========================
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
-# =========================
-# main.py — TSN Payment Bot (Part 2/2)
-# OCR + Anti-duplicate + Reminders + Admin notify
-# =========================
-
-import re
-import hashlib
-from datetime import date, timedelta
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from google.cloud import vision
-
-# =========================
-# 12. GOOGLE VISION OCR
-# =========================
-vision_client = vision.ImageAnnotatorClient(credentials=creds)
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def parse_amount_from_text(text: str):
-    m = re.findall(r"(\d[\d\s]{2,}\d)", text)
-    if not m:
+def parse_amount_from_text(text: str) -> Optional[int]:
+    matches = re.findall(r"(\d[\d\s]{2,}\d)", text)
+    if not matches:
         return None
     try:
-        return int(float(m[0].replace(" ", "")))
-    except Exception:
+        return int(matches[0].replace(" ", ""))
+    except:
         return None
 
-def parse_date_from_text(text: str):
+def parse_date_from_text(text: str) -> Optional[date]:
     m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
     if not m:
         return None
     try:
         return datetime.strptime(m.group(1), "%d.%m.%Y").date()
-    except Exception:
+    except:
         return None
 
 async def ocr_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
@@ -375,54 +276,47 @@ async def ocr_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
         "amount": parse_amount_from_text(text),
         "date": parse_date_from_text(text),
     }
+
+def is_duplicate_check(file_hash: str) -> bool:
+    for r in sheet_checks.get_all_records():
+        if str(r.get("Хэш", "")) == file_hash:
+            return True
+    return False
+
+def current_month_key(d: Optional[date]) -> str:
+    d = d or date.today()
+    return f"{d.year}-{d.month:02d}"
+
+# =========================
+# 11. GOOGLE DRIVE (папки по участкам)
+# =========================
+
 def drive_get_or_create_plot_folder(plot: str) -> str:
-    q = f"mimeType='application/vnd.google-apps.folder' and name='{plot}' and trashed=false"
-    res = drive_service.files().list(q=q, fields="files(id, name)").execute()
+    res = drive_service.files().list(
+        q=f"mimeType='application/vnd.google-apps.folder' and name='{plot}' and trashed=false",
+        fields="files(id, name)"
+    ).execute()
     files = res.get("files", [])
     if files:
         return files[0]["id"]
 
-    meta = {
-        "name": plot,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
+    meta = {"name": plot, "mimeType": "application/vnd.google-apps.folder"}
     folder = drive_service.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
-
 def drive_upload_check(plot: str, filename: str, data: bytes):
     folder_id = drive_get_or_create_plot_folder(plot)
-
-    media = MediaIoBaseDownload(io.BytesIO(data), None)  # заглушка для типа
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
     drive_service.files().create(
         body={"name": filename, "parents": [folder_id]},
-        media_body=io.BytesIO(data)
+        media_body=media,
+        fields="id"
     ).execute()
 
 # =========================
-# 13. ЛИСТ ДЛЯ ЧЕКОВ + АНТИДУБЛИКАТЫ
+# 12. ОБРАБОТКА ФОТО ЧЕКА
 # =========================
-sheet_checks = get_sheet("Лист 2")  # tg_id, ФИО, Участок, Ожидалось, В чеке, Месяц, Хэш, Статус, Дата
 
-def is_duplicate_check(file_hash: str) -> bool:
-    rows = sheet_checks.get_all_records()
-    for r in rows:
-        if r.get("Хэш") == file_hash:
-            return True
-    return False
-
-def current_month_key(d: date | None) -> str:
-    d = d or date.today()
-    return f"{d.year}-{d.month:02d}"
-
-def compare_amounts(expected: int, actual: int | None) -> bool:
-    if actual is None:
-        return False
-    return abs(expected - actual) <= 5  # допускаем погрешность
-
-# =========================
-# 14. ОБРАБОТКА ЧЕКА (👉 Оплатил → фото)
-# =========================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     fio = get_user_fio(uid)
@@ -432,25 +326,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     file = await photo.get_file()
     data = await file.download_as_bytearray()
-    h = sha256_bytes(bytes(data))
+    data_bytes = bytes(data)
 
-    if is_duplicate_check(h):
+    file_hash = sha256_bytes(data_bytes)
+
+    if is_duplicate_check(file_hash):
         await update.message.reply_text("⚠️ Этот чек уже был загружен ранее (дубликат).")
         return
 
-    ocr = await ocr_image_bytes(bytes(data))
+    ocr = await ocr_image_bytes(data_bytes)
     amount = ocr["amount"]
-    d = ocr["date"]
+    check_date = ocr["date"]
 
-# загрузка чека на Google Drive в папку участка
-try:
-    drive_upload_check(plot, f"check_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", bytes(data))
-except Exception as e:
-    logger.error(f"Ошибка загрузки чека в Drive: {e}")
+    try:
+        drive_upload_check(plot, f"check_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", data_bytes)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки в Drive: {e}")
 
-    ok_amount = compare_amounts(expected, amount)
+    ok_amount = (amount is not None and abs(expected - amount) <= 5)
     status = "принято" if ok_amount else "на проверке"
-    month_key = current_month_key(d)
+    month_key = current_month_key(check_date)
 
     sheet_checks.append_row([
         uid,
@@ -459,13 +354,13 @@ except Exception as e:
         expected,
         amount or "",
         month_key,
-        h,
+        file_hash,
         status,
         datetime.now().strftime("%d.%m.%Y %H:%M"),
     ])
 
     msg = (
-        f"🧾 Чек обработан:\n\n"
+        f"🧾 Чек принят:\n\n"
         f"ФИО: {fio}\n"
         f"Участок: {plot}\n"
         f"Ожидалось: {expected} ₽\n"
@@ -475,43 +370,37 @@ except Exception as e:
     )
     await update.message.reply_text(msg)
 
-# Регистрируем новый обработчик фото (перекрывает старый из Части 1)
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
 # =========================
-# 15. APSCHEDULER: 5–3–1 + ПРОСРОЧКА
+# 13. APSCHEDULER — НАПОМИНАНИЯ 5–3–1 + ПРОСРОЧКА
 # =========================
+
 scheduler = AsyncIOScheduler()
 
 async def job_reminders():
-    rows = sheet_main.get_all_records()
     today = date.today().day
-
-    for r in rows:
+    for r in sheet_main.get_all_records():
         try:
             tg_id = int(r.get("tg_id"))
-        except Exception:
+        except:
             continue
 
         fio = r.get("ФИО", "")
         plot = r.get("Участок", "")
-        expected = r.get("Сумма", "")
+        amount = r.get("Сумма", "")
         due_day = int(r.get("День оплаты", 0))
-        status = str(r.get("Статус", "")).lower()
-
-        if not due_day:
-            continue
 
         delta = due_day - today
 
         if delta == 5:
-            text = f"👋 {fio}, через 5 дней срок оплаты взноса по участку №{plot}."
+            text = f"👋 {fio}, через 5 дней срок оплаты взноса по участку №{plot} ({amount} ₽)."
         elif delta == 3:
             text = f"🔔 {fio}, напоминаем об оплате взноса по участку №{plot}. Осталось 3 дня."
         elif delta == 1:
             text = f"⏰ {fio}, завтра день оплаты взноса по участку №{plot}."
         elif delta < 0:
-            text = f"⚠️ {fio}, по участку №{plot} зафиксирована просрочка оплаты. Просим погасить задолженность."
+            text = f"⚠️ {fio}, по участку №{plot} есть просрочка оплаты. Просим погасить задолженность."
         else:
             continue
 
@@ -520,36 +409,25 @@ async def job_reminders():
         except Exception as e:
             logger.warning(f"Не удалось отправить напоминание {tg_id}: {e}")
 
-# Запускаем планировщик раз в день
 scheduler.add_job(job_reminders, "interval", hours=24)
 
-@app.on_event("startup")
-async def start_scheduler():
-    scheduler.start()
-    logger.info("⏰ APScheduler запущен (напоминания 5–3–1 + просрочки)")
-
-@app.on_event("shutdown")
-async def stop_scheduler():
-    scheduler.shutdown()
-
 # =========================
-# 16. АДМИН: УВЕДОМИТЬ СОБСТВЕННИКА ПО УЧАСТКУ
+# 14. АДМИН: МАССОВОЕ УВЕДОМЛЕНИЕ ПО УЧАСТКУ
 # =========================
+
 ADMIN_NOTIFY_STATE: Dict[int, str] = {}
 
 async def admin_notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    rows = sheet_main.get_all_records()
-    plots = sorted({str(r.get("Участок", "")).strip() for r in rows if r.get("Участок")})
-
+    plots = sorted({str(r.get("Участок", "")).strip() for r in sheet_main.get_all_records() if r.get("Участок")})
     keyboard = [[KeyboardButton(p)] for p in plots]
     keyboard.append([KeyboardButton("❌ Отмена")])
 
     ADMIN_NOTIFY_STATE[update.effective_user.id] = "await_plot"
     await update.message.reply_text(
-        "Выберите участок для отправки уведомления:",
+        "Выберите участок для уведомления:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
@@ -560,16 +438,15 @@ async def admin_notify_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message.text == "❌ Отмена":
         ADMIN_NOTIFY_STATE.pop(uid, None)
-        await update.message.reply_text("❌ Отменено.", reply_markup=admin_panel_keyboard())
+        await update.message.reply_text("Отменено.", reply_markup=admin_panel_keyboard())
         return
 
     if ADMIN_NOTIFY_STATE.get(uid) != "await_plot":
         return
 
     plot = update.message.text.strip()
-    rows = sheet_main.get_all_records()
     target = None
-    for r in rows:
+    for r in sheet_main.get_all_records():
         if str(r.get("Участок", "")).strip() == plot:
             target = r
             break
@@ -584,14 +461,49 @@ async def admin_notify_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"👋 {fio}, добрый день!\n\n"
-        f"Напоминаем о необходимости оплаты взноса по участку №{plot}.\n"
-        f"Сумма к оплате: {amount} ₽.\n\n"
-        f"Если вы уже оплатили — отправьте, пожалуйста, чек через бота 🙏"
+        f"Напоминаем об оплате взноса по участку №{plot}.\n"
+        f"Сумма: {amount} ₽.\n\n"
+        f"Если вы уже оплатили — отправьте чек через бота 🙏"
     )
 
     await application.bot.send_message(chat_id=tg_id, text=text)
-    await update.message.reply_text(f"✅ Уведомление отправлено собственнику участка {plot}.")
+    await update.message.reply_text(f"✅ Уведомление отправлено для участка {plot}.")
     ADMIN_NOTIFY_STATE.pop(uid, None)
 
 application.add_handler(MessageHandler(filters.Regex("^📨 Уведомить собственника$"), admin_notify_start))
 application.add_handler(MessageHandler(filters.TEXT & filters.User(list(ADMIN_IDS)), admin_notify_flow))
+
+# =========================
+# 15. WEBHOOK
+# =========================
+
+@app.post("/webhook")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, application.bot)
+    await application.update_queue.put(update)
+    return {"ok": True}
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
+@app.on_event("startup")
+async def on_startup():
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+    scheduler.start()
+    logger.info("✅ Bot + Webhook + Scheduler запущены")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    scheduler.shutdown()
+    await application.stop()
+    await application.shutdown()
+
+# =========================
+# 16. ENTRYPOINT
+# =========================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
