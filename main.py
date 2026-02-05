@@ -122,11 +122,17 @@ def get_user_fio(tg_id: int) -> str:
 def get_requisites() -> Dict[str, str]:
     rows = sheet_reqs.get_all_records()
     req = {}
+
     for r in rows:
-        k = r.get("Ключ")
-        v = r.get("Значение")
-        if k:
-            req[k] = v
+        key = r.get("Ключ")
+        val = r.get("Значение")
+        if key:
+            req[key] = val
+
+        if r.get("QR_оплата"):
+            req["QR_оплата"] = r.get("QR_оплата")
+
+    return req
     # QR_оплата может быть отдельным столбцом
     for r in rows:
         if r.get("QR_оплата"):
@@ -138,10 +144,22 @@ def get_requisites() -> Dict[str, str]:
 # 6. ОПЛАТА (Deeplink)
 # =========================
 BANKS = {
-    "sbp":  {"name": "🟢 СБП",     "deeplink": "https://qr.nspk.ru/AS1A0000000000000000000000000000000000?amount={amount}"},
-    "vtb":  {"name": "🔵 ВТБ",     "deeplink": "https://online.vtb.ru/pay?amount={amount}"},
-    "alpha":{"name": "🔴 Альфа",   "deeplink": "https://alfabank.ru/pay/?amount={amount}"},
-    "tbank":{"name": "🟡 Т-Банк",  "deeplink": "https://www.tbank.ru/pay/?amount={amount}"},
+    "sbp": {
+        "name": "🟢 СБП",
+        "deeplink": "https://qr.nspk.ru/AS1A0000000000000000000000000000000000?amount={amount}"
+    },
+    "vtb": {
+        "name": "🔵 ВТБ",
+        "deeplink": "https://online.vtb.ru/payments?amount={amount}"
+    },
+    "alpha": {
+        "name": "🔴 Альфа-Банк",
+        "deeplink": "https://alfabank.ru/payments/transfer?amount={amount}"
+    },
+    "tbank": {
+        "name": "🟡 Т-Банк",
+        "deeplink": "https://www.tinkoff.ru/payments/form?amount={amount}"
+    },
 }
 
 def build_payment_keyboard(amount: int) -> InlineKeyboardMarkup:
@@ -266,7 +284,7 @@ async def admin_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status, done = downloader.next_chunk()
 
     fh.seek(0)
-    await update.message.reply_document(fh, filename=name, caption="🗺 Карта посёлка")
+    await update.message.reply_photo(photo=fh, caption="🗺 Карта посёлка")
 
 # =========================
 # 9. WEBHOOK
@@ -357,6 +375,29 @@ async def ocr_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
         "amount": parse_amount_from_text(text),
         "date": parse_date_from_text(text),
     }
+def drive_get_or_create_plot_folder(plot: str) -> str:
+    q = f"mimeType='application/vnd.google-apps.folder' and name='{plot}' and trashed=false"
+    res = drive_service.files().list(q=q, fields="files(id, name)").execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    meta = {
+        "name": plot,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    folder = drive_service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+
+def drive_upload_check(plot: str, filename: str, data: bytes):
+    folder_id = drive_get_or_create_plot_folder(plot)
+
+    media = MediaIoBaseDownload(io.BytesIO(data), None)  # заглушка для типа
+    drive_service.files().create(
+        body={"name": filename, "parents": [folder_id]},
+        media_body=io.BytesIO(data)
+    ).execute()
 
 # =========================
 # 13. ЛИСТ ДЛЯ ЧЕКОВ + АНТИДУБЛИКАТЫ
@@ -400,6 +441,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ocr = await ocr_image_bytes(bytes(data))
     amount = ocr["amount"]
     d = ocr["date"]
+
+# загрузка чека на Google Drive в папку участка
+try:
+    drive_upload_check(plot, f"check_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", bytes(data))
+except Exception as e:
+    logger.error(f"Ошибка загрузки чека в Drive: {e}")
 
     ok_amount = compare_amounts(expected, amount)
     status = "принято" if ok_amount else "на проверке"
@@ -493,13 +540,29 @@ ADMIN_NOTIFY_STATE: Dict[int, str] = {}
 async def admin_notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
+
+    rows = sheet_main.get_all_records()
+    plots = sorted({str(r.get("Участок", "")).strip() for r in rows if r.get("Участок")})
+
+    keyboard = [[KeyboardButton(p)] for p in plots]
+    keyboard.append([KeyboardButton("❌ Отмена")])
+
     ADMIN_NOTIFY_STATE[update.effective_user.id] = "await_plot"
-    await update.message.reply_text("Введите номер участка для уведомления собственника:")
+    await update.message.reply_text(
+        "Выберите участок для отправки уведомления:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
 
 async def admin_notify_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         return
+
+    if update.message.text == "❌ Отмена":
+        ADMIN_NOTIFY_STATE.pop(uid, None)
+        await update.message.reply_text("❌ Отменено.", reply_markup=admin_panel_keyboard())
+        return
+
     if ADMIN_NOTIFY_STATE.get(uid) != "await_plot":
         return
 
