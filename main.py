@@ -1,19 +1,24 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
 import uvicorn
-
-from bot import tg_app
-from web.admin import router as admin_router
-from services.scheduler import scheduler
-from config import PORT, WEBHOOK_URL, WEBHOOK_SECRET
+from fastapi import FastAPI, Request
 from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters
+)
+
+from config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET, PORT
+from bot.handlers import start, handle_text, reg_flow
+from web.dashboard import router as dashboard_router
 
 app = FastAPI()
-app.include_router(admin_router)
+
+tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+tg_app.add_handler(CommandHandler("start", start))
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reg_flow))
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 @app.on_event("startup")
-async def startup():
-    scheduler.start()
+async def on_startup():
     await tg_app.initialize()
     await tg_app.start()
     await tg_app.bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -23,7 +28,9 @@ async def webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
-    return JSONResponse({"ok": True})
+    return {"ok": True}
+
+app.include_router(dashboard_router, prefix="/admin")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
