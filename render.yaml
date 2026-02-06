@@ -1,10 +1,9 @@
 services:
   - type: web
-    name: tsn-telegram-bot
+    name: tsn-bot
     env: python
-    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: PORT
-        value: 1000
+        value: 8080
