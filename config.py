@@ -1,9 +1,9 @@
 import os
-import json
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
+_raw_admins = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = set(map(int, _raw_admins.split(","))) if _raw_admins.strip() else set()
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
