@@ -6,7 +6,7 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET, PORT
-from bot.handlers import start, handle_text, reg_flow
+from bot.handlers import register_handlers
 from web.dashboard import router as dashboard_router
 
 app = FastAPI()
