@@ -1,150 +1,133 @@
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters
+)
 
 from services.google_sheets import (
     find_by_plot,
     find_by_tg,
     add_owner,
-    update_field
+    update_field,
 )
+
+from services.payments import make_spb_qr, bank_deeplink
+from services.ocr import ocr_text, gpt_parse_receipt
+
+# ====== КЛАВИАТУРЫ ======
 
 def owner_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Оплатить", callback_data="pay")],
         [InlineKeyboardButton("📊 Статус", callback_data="status")],
         [InlineKeyboardButton("📄 Реквизиты", callback_data="reqs")],
-        [InlineKeyboardButton("🧾 Загрузить чек", callback_data="receipt")]
+        [InlineKeyboardButton("👉 Я оплатил", callback_data="paid")],
+    ])
+
+def payment_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ СБП", callback_data="pay_sbp")],
+        [InlineKeyboardButton("🏦 ВТБ", callback_data="pay_vtb")],
+        [InlineKeyboardButton("🅰️ Альфа", callback_data="pay_alfa")],
+        [InlineKeyboardButton("🟡 Т-Банк", callback_data="pay_tbank")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
     ])
 
 # ====== /start ======
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
     owner = find_by_tg(user.id)
+
     if owner:
         await update.message.reply_text(
-            f"С возвращением, {owner.get('ФИО')} 👋\nВыберите действие:",
+            f"С возвращением, {owner.get('ФИО')} 👋",
             reply_markup=owner_menu()
         )
         return
 
     context.user_data.clear()
     context.user_data["await_plot"] = True
-    await update.message.reply_text("Введите номер участка для привязки:")
+    await update.message.reply_text("Введите номер участка:")
 
-# ====== ТЕКСТОВЫЕ СООБЩЕНИЯ ======
+# ====== CALLBACK ======
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "pay":
+        await q.message.reply_text("Выберите банк:", reply_markup=payment_menu())
+        return
+
+    if q.data.startswith("pay_"):
+        bank = q.data.replace("pay_", "")
+        context.user_data["await_amount"] = True
+        context.user_data["bank"] = bank
+        await q.message.reply_text(f"Введите сумму для оплаты через {bank.upper()}:")
+        return
+
+    if q.data == "paid":
+        context.user_data["await_receipt"] = True
+        await q.message.reply_text("Пришлите фото чека 📸")
+        return
+
+# ====== ТЕКСТ ======
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     text = update.message.text.strip()
 
-    # 1. Ждём номер участка
-    if context.user_data.get("await_plot"):
-        plot = text
-        owner = find_by_plot(plot)
-
-        if not owner:
-            context.user_data["reg_plot"] = plot
-            context.user_data["await_plot"] = False
-            context.user_data["await_fio"] = True
-            await update.message.reply_text("❌ Участок не найден.\nВведите ФИО для регистрации:")
+    if context.user_data.get("await_amount"):
+        try:
+            amount = float(text.replace(",", "."))
+        except:
+            await update.message.reply_text("Введите корректную сумму")
             return
 
-        # Участок найден — привязываем Telegram
-        update_field(plot, "Telegram_ID", user.id)
-        update_field(plot, "username", user.username or "")
-
-        # Проверяем недостающие поля
-        missing = []
-        if not owner.get("Телефон"):
-            missing.append("phone")
-        if not owner.get("Дата_рождения"):
-            missing.append("birth")
-
+        bank = context.user_data["bank"]
         context.user_data.clear()
 
-        if missing:
-            context.user_data["plot"] = plot
-            context.user_data["missing"] = missing
+        if bank == "sbp":
+            qr_bytes = make_spb_qr(amount)
+            await update.message.reply_photo(qr_bytes, caption=f"QR для оплаты {amount} ₽ через СБП")
+        else:
+            link = bank_deeplink(bank, amount)
+            await update.message.reply_text(f"Ссылка для оплаты:\n{link}")
 
-            if "phone" in missing:
-                context.user_data["await_phone"] = True
-                await update.message.reply_text("Укажите номер телефона:")
-                return
-
-        await update.message.reply_text(
-            f"✅ Участок {plot} привязан к вашему Telegram.",
-            reply_markup=owner_menu()
-        )
         return
 
-    # 2. Регистрация: ФИО
-    if context.user_data.get("await_fio"):
-        context.user_data["fio"] = text
-        context.user_data["await_fio"] = False
-        context.user_data["await_phone"] = True
-        await update.message.reply_text("Введите номер телефона:")
+    await update.message.reply_text("Нажмите /start")
+
+# ====== ФОТО ЧЕКА ======
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("await_receipt"):
+        await update.message.reply_text("Сначала нажмите 👉 Я оплатил")
         return
 
-    # 3. Телефон
-    if context.user_data.get("await_phone"):
-        phone = text
-        context.user_data["phone"] = phone
-        context.user_data["await_phone"] = False
+    file = await update.message.photo[-1].get_file()
+    image_bytes = await file.download_as_bytearray()
 
-        # если это дополнение данных
-        if "missing" in context.user_data:
-            plot = context.user_data["plot"]
-            update_field(plot, "Телефон", phone)
+    text = ocr_text(bytes(image_bytes))
+    parsed = await gpt_parse_receipt(text)
 
-            if "birth" in context.user_data["missing"]:
-                context.user_data["await_birth"] = True
-                await update.message.reply_text("Введите дату рождения (ГГГГ-ММ-ДД):")
-                return
+    context.user_data.clear()
 
-            context.user_data.clear()
-            await update.message.reply_text("✅ Данные обновлены.", reply_markup=owner_menu())
-            return
+    await update.message.reply_text(
+        f"🧾 Чек распознан:\n"
+        f"💰 Сумма: {parsed.get('amount')}\n"
+        f"📅 Дата: {parsed.get('date')}\n"
+        f"🏦 Банк: {parsed.get('bank')}\n"
+        f"🤖 Уверенность: {parsed.get('confidence')}"
+    )
 
-        # если это регистрация
-        context.user_data["await_birth"] = True
-        await update.message.reply_text("Введите дату рождения (ГГГГ-ММ-ДД):")
-        return
-
-    # 4. Дата рождения
-    if context.user_data.get("await_birth"):
-        birth = text
-
-        plot = context.user_data.get("reg_plot")
-        fio = context.user_data.get("fio")
-        phone = context.user_data.get("phone")
-
-        if plot and fio and phone:
-            add_owner(
-                plot=plot,
-                fio=fio,
-                tg_id=user.id,
-                username=user.username or "",
-                phone=phone,
-                birth=birth
-            )
-            context.user_data.clear()
-            await update.message.reply_text("✅ Регистрация завершена. Добро пожаловать!", reply_markup=owner_menu())
-            return
-
-        # если это дополнение
-        plot = context.user_data.get("plot")
-        update_field(plot, "Дата_рождения", birth)
-        context.user_data.clear()
-        await update.message.reply_text("✅ Данные обновлены.", reply_markup=owner_menu())
-        return
-
-    # 5. Если пользователь пишет что-то не в сценарии
-    await update.message.reply_text("Не понял сообщение 🤔\nНажмите /start чтобы начать.")
-
-# ====== РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ======
+# ====== РЕГИСТРАЦИЯ ======
 
 def register_handlers(app):
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
